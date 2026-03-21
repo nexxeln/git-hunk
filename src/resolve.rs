@@ -19,6 +19,7 @@ pub enum ResolveStatus {
 #[derive(Debug, Clone, Serialize)]
 pub struct ResolveCandidate {
     pub change_id: String,
+    pub change_key: String,
     pub hunk_id: String,
     pub side: LineSide,
     pub start: u32,
@@ -40,6 +41,7 @@ pub struct ResolveResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hunk_id: Option<String>,
     pub recommended_change_ids: Vec<String>,
+    pub recommended_change_keys: Vec<String>,
     pub recommended_hunk_selectors: Vec<String>,
     pub candidates: Vec<ResolveCandidate>,
 }
@@ -155,6 +157,7 @@ pub fn resolve_region(
         status: best.status,
         hunk_id: (best.hunk_ids.len() == 1).then(|| best.hunk_ids[0].clone()),
         recommended_change_ids: best.change_ids,
+        recommended_change_keys: best.change_keys,
         recommended_hunk_selectors: best.hunk_selectors,
         candidates: best.candidates,
     })
@@ -167,6 +170,7 @@ struct SideResolution {
     distance: u32,
     adjustment: u32,
     change_ids: Vec<String>,
+    change_keys: Vec<String>,
     hunk_ids: Vec<String>,
     hunk_selectors: Vec<String>,
     candidates: Vec<ResolveCandidate>,
@@ -253,6 +257,7 @@ fn build_resolution(
     let mut hunk_ranges = BTreeMap::<usize, (u32, u32)>::new();
     let mut hunk_ids = Vec::new();
     let mut change_ids = Vec::new();
+    let mut change_keys = Vec::new();
     let mut candidates = Vec::new();
 
     for (change_index, range_start, range_end, change_distance) in entries {
@@ -268,8 +273,10 @@ fn build_resolution(
             hunk_ids.push(hunk.id.clone());
         }
         change_ids.push(change.id.clone());
+        change_keys.push(change.change_key.clone());
         candidates.push(ResolveCandidate {
             change_id: change.id.clone(),
+            change_key: change.change_key.clone(),
             hunk_id: hunk.id.clone(),
             side,
             start: range_start,
@@ -312,6 +319,7 @@ fn build_resolution(
         distance,
         adjustment,
         change_ids,
+        change_keys,
         hunk_ids,
         hunk_selectors,
         candidates,

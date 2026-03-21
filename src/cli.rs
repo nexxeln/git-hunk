@@ -115,6 +115,8 @@ pub struct MutateArgs {
     pub hunks: Vec<String>,
     #[arg(long = "change")]
     pub changes: Vec<String>,
+    #[arg(long = "change-key")]
+    pub change_keys: Vec<String>,
     #[arg(long)]
     pub compact: bool,
     #[arg(long)]
@@ -133,6 +135,8 @@ pub struct CommitArgs {
     pub hunks: Vec<String>,
     #[arg(long = "change")]
     pub changes: Vec<String>,
+    #[arg(long = "change-key")]
+    pub change_keys: Vec<String>,
     #[arg(long)]
     pub allow_empty: bool,
     #[arg(long)]

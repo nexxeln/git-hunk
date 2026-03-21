@@ -107,6 +107,10 @@ fn resolve_exact_change_prefers_change_id() {
     assert_eq!(resolved["matched_side"], "new");
     assert_eq!(resolved["recommended_change_ids"][0], first_change);
     assert_eq!(
+        resolved["recommended_change_keys"][0],
+        change_key_for_path(&scan, "note.txt", 0)
+    );
+    assert_eq!(
         resolved["recommended_hunk_selectors"][0],
         format!("{}:new:2-2", first_hunk_id_for_path(&scan, "note.txt"))
     );
@@ -290,6 +294,176 @@ fn resolve_rejects_unknown_path() {
     let err: Value = serde_json::from_slice(&output.stderr).unwrap();
     assert_eq!(err["error"]["code"], "unknown_path");
     assert_eq!(err["error"]["category"], "selector");
+}
+
+#[test]
+fn scan_change_keys_remain_stable_across_unrelated_file_edits() {
+    let repo = init_repo();
+    seed_committed_file(repo.path());
+    write_file(
+        repo.path(),
+        "note.txt",
+        "alpha\nbeta-1\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\niota\nkappa\n",
+    );
+
+    let scan_before = cli_json(repo.path(), &["scan", "--mode", "stage", "--json"]);
+    let change_id_before = change_id_for_path(&scan_before, "note.txt", 0);
+    let change_key_before = change_key_for_path(&scan_before, "note.txt", 0);
+
+    write_file(repo.path(), "other.txt", "unrelated\n");
+
+    let scan_after = cli_json(repo.path(), &["scan", "--mode", "stage", "--json"]);
+    let change_id_after = change_id_for_path(&scan_after, "note.txt", 0);
+    let change_key_after = change_key_for_path(&scan_after, "note.txt", 0);
+
+    assert_ne!(change_id_before, change_id_after);
+    assert_eq!(change_key_before, change_key_after);
+}
+
+#[test]
+fn scan_assigns_unique_change_keys_to_duplicate_local_changes() {
+    let repo = init_repo();
+    write_file(repo.path(), "dup.txt", "x\ntarget\nx\ntarget\nx\n");
+    git(repo.path(), &["add", "dup.txt"]);
+    git(repo.path(), &["commit", "-m", "dup seed"]);
+
+    write_file(repo.path(), "dup.txt", "x\nTARGET\nx\nTARGET\nx\n");
+
+    let scan = cli_json(repo.path(), &["scan", "--mode", "stage", "--json"]);
+    let first_key = change_key_for_path(&scan, "dup.txt", 0);
+    let second_key = change_key_for_path(&scan, "dup.txt", 1);
+
+    assert_ne!(first_key, second_key);
+    assert!(first_key.starts_with("ck_"));
+    assert!(second_key.starts_with("ck_"));
+}
+
+#[test]
+fn change_keys_stay_stable_when_duplicate_changes_split_into_separate_hunks() {
+    let repo = init_repo();
+    write_file(
+        repo.path(),
+        "dup.txt",
+        "a1\nsame\nb1\nb2\nb3\nb4\nsame\nc1\n",
+    );
+    git(repo.path(), &["add", "dup.txt"]);
+    git(repo.path(), &["commit", "-m", "dup split seed"]);
+
+    write_file(
+        repo.path(),
+        "dup.txt",
+        "a1\nSAME\nb1\nb2\nb3\nb4\nSAME\nc1\n",
+    );
+    let scan_joined = cli_json(repo.path(), &["scan", "--mode", "stage", "--json"]);
+    let before = change_keys_for_path_with_preview(&scan_joined, "dup.txt", "SAME");
+
+    write_file(
+        repo.path(),
+        "dup.txt",
+        "a1\nSAME\nb1\nb2\nextra1\nextra2\nextra3\nextra4\nb3\nb4\nSAME\nc1\n",
+    );
+    let scan_split = cli_json(repo.path(), &["scan", "--mode", "stage", "--json"]);
+    let after = change_keys_for_path_with_preview(&scan_split, "dup.txt", "SAME");
+
+    assert_eq!(before, after);
+}
+
+#[test]
+fn show_accepts_change_key() {
+    let repo = init_repo();
+    seed_committed_file(repo.path());
+    write_file(
+        repo.path(),
+        "note.txt",
+        "alpha\nbeta-1\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\niota\nkappa\n",
+    );
+
+    let scan = cli_json(repo.path(), &["scan", "--mode", "stage", "--json"]);
+    let change_key = change_key_for_path(&scan, "note.txt", 0);
+
+    let shown = cli_output(
+        repo.path(),
+        &["show", "--mode", "stage", &change_key, "--json"],
+    );
+    assert!(shown.status.success());
+    let shown: Value = serde_json::from_slice(&shown.stdout).unwrap();
+    assert_eq!(shown["change"]["change_key"], change_key);
+}
+
+#[test]
+fn stage_can_select_by_change_key_after_rescan() {
+    let repo = init_repo();
+    seed_committed_file(repo.path());
+    write_file(
+        repo.path(),
+        "note.txt",
+        "alpha\nbeta-1\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\niota-1\nkappa\n",
+    );
+
+    let scan_before = cli_json(repo.path(), &["scan", "--mode", "stage", "--json"]);
+    let change_key = change_key_for_path(&scan_before, "note.txt", 0);
+
+    write_file(repo.path(), "other.txt", "unrelated\n");
+
+    let scan_after = cli_json(repo.path(), &["scan", "--mode", "stage", "--json"]);
+    let snapshot = scan_after["snapshot_id"].as_str().unwrap();
+
+    let staged = cli_json(
+        repo.path(),
+        &[
+            "stage",
+            "--snapshot",
+            snapshot,
+            "--change-key",
+            &change_key,
+            "--json",
+        ],
+    );
+    assert_eq!(staged["selected_change_keys"][0], change_key);
+
+    let staged_diff = git_stdout(repo.path(), &["diff", "--cached", "--", "note.txt"]);
+    assert!(staged_diff.contains("beta-1"));
+    assert!(!staged_diff.contains("iota-1"));
+    let other_staged = git_stdout(repo.path(), &["diff", "--cached", "--", "other.txt"]);
+    assert!(other_staged.trim().is_empty());
+}
+
+#[test]
+fn plan_file_can_select_change_key() {
+    let repo = init_repo();
+    seed_committed_file(repo.path());
+    write_file(
+        repo.path(),
+        "note.txt",
+        "alpha\nbeta-1\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\niota-1\nkappa\n",
+    );
+
+    let scan = cli_json(repo.path(), &["scan", "--mode", "stage", "--json"]);
+    let snapshot = scan["snapshot_id"].as_str().unwrap();
+    let change_key = change_key_for_path(&scan, "note.txt", 0);
+    let plan_file = NamedTempFile::new().unwrap();
+    fs::write(
+        plan_file.path(),
+        format!(
+            "{{\n  \"snapshot_id\": \"{}\",\n  \"selectors\": [\n    {{ \"type\": \"change_key\", \"key\": \"{}\" }}\n  ]\n}}\n",
+            snapshot, change_key
+        ),
+    )
+    .unwrap();
+
+    let _stage = cli_json(
+        repo.path(),
+        &[
+            "stage",
+            "--plan",
+            plan_file.path().to_str().unwrap(),
+            "--json",
+        ],
+    );
+
+    let staged_diff = git_stdout(repo.path(), &["diff", "--cached", "--", "note.txt"]);
+    assert!(staged_diff.contains("beta-1"));
+    assert!(!staged_diff.contains("iota-1"));
 }
 
 #[test]
@@ -779,6 +953,55 @@ fn nth_change_id(scan: &Value, index: usize) -> String {
         .and_then(|change| change["id"].as_str())
         .unwrap()
         .to_string()
+}
+
+fn change_id_for_path(scan: &Value, path: &str, index: usize) -> String {
+    scan["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|file| file["path"] == path)
+        .into_iter()
+        .flat_map(|file| file["hunks"].as_array().unwrap().iter())
+        .flat_map(|hunk| hunk["changes"].as_array().unwrap().iter())
+        .nth(index)
+        .and_then(|change| change["id"].as_str())
+        .unwrap()
+        .to_string()
+}
+
+fn change_key_for_path(scan: &Value, path: &str, index: usize) -> String {
+    scan["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|file| file["path"] == path)
+        .into_iter()
+        .flat_map(|file| file["hunks"].as_array().unwrap().iter())
+        .flat_map(|hunk| hunk["changes"].as_array().unwrap().iter())
+        .nth(index)
+        .and_then(|change| change["change_key"].as_str())
+        .unwrap()
+        .to_string()
+}
+
+fn change_keys_for_path_with_preview(scan: &Value, path: &str, needle: &str) -> Vec<String> {
+    scan["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|file| file["path"] == path)
+        .into_iter()
+        .flat_map(|file| file["hunks"].as_array().unwrap().iter())
+        .flat_map(|hunk| hunk["changes"].as_array().unwrap().iter())
+        .filter(|change| {
+            change["metadata"]["preview"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(needle)
+        })
+        .map(|change| change["change_key"].as_str().unwrap().to_string())
+        .collect()
 }
 
 fn cli_json(repo: &Path, args: &[&str]) -> Value {

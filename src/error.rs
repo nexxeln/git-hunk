@@ -82,6 +82,7 @@ fn classify(code: &str) -> (ErrorCategory, bool) {
         | "missing_selection"
         | "unknown_hunk"
         | "unknown_change"
+        | "unknown_change_key"
         | "unknown_id"
         | "unknown_path"
         | "no_changes_in_path"

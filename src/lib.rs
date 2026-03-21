@@ -62,6 +62,16 @@ fn show_command(repo_root: &PathBuf, args: ShowArgs) -> AppResult<CommandOutput>
         }));
     }
 
+    if let Some((file, change)) = state.find_change_key(&args.id) {
+        return Ok(CommandOutput::Show(ShowResponse::Change {
+            snapshot_id: state.snapshot.snapshot_id.clone(),
+            mode: state.snapshot.mode,
+            path: file.path.clone(),
+            status: file.status,
+            change: change.clone(),
+        }));
+    }
+
     Err(AppError::new(
         "unknown_id",
         format!("no hunk or change found for id '{}'", args.id),
@@ -73,6 +83,7 @@ fn resolve_command(repo_root: &PathBuf, args: ResolveArgs) -> AppResult<CommandO
         snapshot_id: Some(args.snapshot),
         hunks: Vec::new(),
         change_ids: Vec::new(),
+        change_keys: Vec::new(),
     };
     let state = validate_snapshot(repo_root, args.mode, &selection)?;
     let response = resolve::resolve_region(
@@ -95,7 +106,13 @@ fn mutate_command(
     } else {
         cli::Mode::Stage
     };
-    let selection = load_selection_input(args.snapshot, args.plan, args.hunks, args.changes)?;
+    let selection = load_selection_input(
+        args.snapshot,
+        args.plan,
+        args.hunks,
+        args.changes,
+        args.change_keys,
+    )?;
     let state = validate_snapshot(repo_root, mode, &selection)?;
     let resolved = select::resolve_selection(&state, &selection)?;
     let patch = patch::build_patch(&state, &resolved)?;
@@ -109,6 +126,7 @@ fn mutate_command(
         mode,
         selected_hunks: resolved.selected_hunks,
         selected_changes: resolved.selected_changes,
+        selected_change_keys: resolved.selected_change_keys,
         selected_line_ranges: resolved.selected_line_ranges,
         snapshot: SnapshotOutput::from_snapshot(next_state.snapshot, args.compact),
     }))
@@ -122,7 +140,13 @@ fn commit_command(repo_root: &PathBuf, args: CommitArgs) -> AppResult<CommandOut
         ));
     }
 
-    let selection = load_selection_input(args.snapshot, args.plan, args.hunks, args.changes)?;
+    let selection = load_selection_input(
+        args.snapshot,
+        args.plan,
+        args.hunks,
+        args.changes,
+        args.change_keys,
+    )?;
     let prepared = prepare_commit_selection(repo_root, &selection)?;
 
     if args.dry_run {
@@ -133,6 +157,7 @@ fn commit_command(repo_root: &PathBuf, args: CommitArgs) -> AppResult<CommandOut
             messages: args.messages,
             selected_hunks: prepared.selected_hunks,
             selected_changes: prepared.selected_changes,
+            selected_change_keys: prepared.selected_change_keys,
             selected_line_ranges: prepared.selected_line_ranges,
             files: preview.files,
             patch: preview.patch,
@@ -159,6 +184,7 @@ fn commit_command(repo_root: &PathBuf, args: CommitArgs) -> AppResult<CommandOut
         snapshot_id: next_state.snapshot.snapshot_id.clone(),
         selected_hunks: prepared.selected_hunks,
         selected_changes: prepared.selected_changes,
+        selected_change_keys: prepared.selected_change_keys,
         selected_line_ranges: prepared.selected_line_ranges,
         snapshot: SnapshotOutput::from_snapshot(next_state.snapshot, args.compact),
     }))
@@ -177,6 +203,7 @@ fn prepare_commit_selection(
             patch: Some(patch),
             selected_hunks: resolved.selected_hunks,
             selected_changes: resolved.selected_changes,
+            selected_change_keys: resolved.selected_change_keys,
             selected_line_ranges: resolved.selected_line_ranges,
         });
     }
@@ -199,6 +226,7 @@ fn prepare_commit_selection(
         patch: None,
         selected_hunks: Vec::new(),
         selected_changes: Vec::new(),
+        selected_change_keys: Vec::new(),
         selected_line_ranges: Vec::new(),
     })
 }
@@ -235,6 +263,7 @@ fn load_selection_input(
     plan_path: Option<PathBuf>,
     hunks: Vec<String>,
     changes: Vec<String>,
+    change_keys: Vec<String>,
 ) -> AppResult<SelectionInput> {
     let mut input = SelectionInput {
         snapshot_id: snapshot,
@@ -243,6 +272,7 @@ fn load_selection_input(
             .map(|raw| HunkSelector::parse(&raw))
             .collect::<AppResult<Vec<_>>>()?,
         change_ids: changes,
+        change_keys,
     };
 
     if let Some(path) = plan_path {
@@ -266,6 +296,7 @@ fn load_selection_input(
             match selector {
                 model::PlanSelector::Hunk { id } => input.hunks.push(HunkSelector::Whole { id }),
                 model::PlanSelector::Change { id } => input.change_ids.push(id),
+                model::PlanSelector::ChangeKey { key } => input.change_keys.push(key),
                 model::PlanSelector::LineRange {
                     hunk_id,
                     side,
@@ -291,6 +322,7 @@ struct PreparedCommitSelection {
     patch: Option<String>,
     selected_hunks: Vec<String>,
     selected_changes: Vec<String>,
+    selected_change_keys: Vec<String>,
     selected_line_ranges: Vec<String>,
 }
 
@@ -370,8 +402,9 @@ impl ShowResponse {
             ShowResponse::Change { path, change, .. } => {
                 let mut out = format!("{} {}\n", path, change.id);
                 out.push_str(&format!(
-                    "{} [{} +{} -{} {}]\n",
+                    "{} ({}) [{} +{} -{} {}]\n",
                     change.header,
+                    change.change_key,
                     change.metadata.kind.as_str(),
                     change.metadata.added_lines,
                     change.metadata.deleted_lines,
@@ -405,6 +438,7 @@ pub struct MutationResponse {
     pub mode: cli::Mode,
     pub selected_hunks: Vec<String>,
     pub selected_changes: Vec<String>,
+    pub selected_change_keys: Vec<String>,
     pub selected_line_ranges: Vec<String>,
     pub snapshot: SnapshotOutput,
 }
@@ -412,10 +446,11 @@ pub struct MutationResponse {
 impl MutationResponse {
     fn to_text(&self) -> String {
         format!(
-            "{}d {} hunks, {} changes, and {} line ranges\nnext snapshot: {}",
+            "{}d {} hunks, {} changes, {} change keys, and {} line ranges\nnext snapshot: {}",
             self.action,
             self.selected_hunks.len(),
             self.selected_changes.len(),
+            self.selected_change_keys.len(),
             self.selected_line_ranges.len(),
             self.snapshot_id
         )
@@ -428,6 +463,7 @@ pub struct CommitResponse {
     pub snapshot_id: String,
     pub selected_hunks: Vec<String>,
     pub selected_changes: Vec<String>,
+    pub selected_change_keys: Vec<String>,
     pub selected_line_ranges: Vec<String>,
     pub snapshot: SnapshotOutput,
 }
@@ -435,10 +471,11 @@ pub struct CommitResponse {
 impl CommitResponse {
     fn to_text(&self) -> String {
         format!(
-            "committed {} using {} hunks, {} changes, and {} line ranges\nnext snapshot: {}",
+            "committed {} using {} hunks, {} changes, {} change keys, and {} line ranges\nnext snapshot: {}",
             self.commit,
             self.selected_hunks.len(),
             self.selected_changes.len(),
+            self.selected_change_keys.len(),
             self.selected_line_ranges.len(),
             self.snapshot_id
         )
@@ -452,6 +489,7 @@ pub struct CommitDryRunResponse {
     pub messages: Vec<String>,
     pub selected_hunks: Vec<String>,
     pub selected_changes: Vec<String>,
+    pub selected_change_keys: Vec<String>,
     pub selected_line_ranges: Vec<String>,
     pub files: Vec<String>,
     pub patch: String,
@@ -461,10 +499,11 @@ pub struct CommitDryRunResponse {
 impl CommitDryRunResponse {
     fn to_text(&self) -> String {
         format!(
-            "would commit {} files using {} hunks, {} changes, and {} line ranges\nsnapshot: {}",
+            "would commit {} files using {} hunks, {} changes, {} change keys, and {} line ranges\nsnapshot: {}",
             self.files.len(),
             self.selected_hunks.len(),
             self.selected_changes.len(),
+            self.selected_change_keys.len(),
             self.selected_line_ranges.len(),
             self.snapshot_id
         )

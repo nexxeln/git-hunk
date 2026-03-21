@@ -132,6 +132,7 @@ impl ChangeMetadata {
 #[derive(Debug, Clone, Serialize)]
 pub struct ChangeView {
     pub id: String,
+    pub change_key: String,
     pub header: String,
     pub old_start: u32,
     pub old_lines: u32,
@@ -183,8 +184,9 @@ impl SnapshotView {
                 out.push_str(&format!("\n  {} {}", hunk.id, hunk.header));
                 for change in &hunk.changes {
                     out.push_str(&format!(
-                        "\n    {} {} +{} -{} {}",
+                        "\n    {} {} {} +{} -{} {}",
                         change.id,
+                        change.change_key,
                         change.metadata.kind.as_str(),
                         change.metadata.added_lines,
                         change.metadata.deleted_lines,
@@ -201,6 +203,7 @@ impl SnapshotView {
 #[derive(Debug, Clone, Serialize)]
 pub struct CompactChangeView {
     pub id: String,
+    pub change_key: String,
     pub header: String,
     pub old_start: u32,
     pub old_lines: u32,
@@ -244,8 +247,9 @@ impl CompactSnapshotView {
                 out.push_str(&format!("\n  {} {}", hunk.id, hunk.header));
                 for change in &hunk.changes {
                     out.push_str(&format!(
-                        "\n    {} {} +{} -{} {}",
+                        "\n    {} {} {} +{} -{} {}",
                         change.id,
+                        change.change_key,
                         change.metadata.kind.as_str(),
                         change.metadata.added_lines,
                         change.metadata.deleted_lines,
@@ -285,6 +289,7 @@ impl From<&SnapshotView> for CompactSnapshotView {
                                 .iter()
                                 .map(|change| CompactChangeView {
                                     id: change.id.clone(),
+                                    change_key: change.change_key.clone(),
                                     header: change.header.clone(),
                                     old_start: change.old_start,
                                     old_lines: change.old_lines,
@@ -359,6 +364,9 @@ pub enum PlanSelector {
     Change {
         id: String,
     },
+    ChangeKey {
+        key: String,
+    },
     LineRange {
         hunk_id: String,
         side: LineSide,
@@ -388,6 +396,7 @@ pub struct HunkState {
 #[derive(Debug, Clone)]
 pub struct ChangeState {
     pub id: String,
+    pub change_key: String,
     pub header: String,
     pub old_start: u32,
     pub old_lines: u32,
@@ -427,6 +436,17 @@ impl ScanState {
                 hunk.changes
                     .iter()
                     .find(|change| change.id == id)
+                    .map(|change| (file, change))
+            })
+        })
+    }
+
+    pub fn find_change_key(&self, key: &str) -> Option<(&FileView, &ChangeView)> {
+        self.snapshot.files.iter().find_map(|file| {
+            file.hunks.iter().find_map(|hunk| {
+                hunk.changes
+                    .iter()
+                    .find(|change| change.change_key == key)
                     .map(|change| (file, change))
             })
         })

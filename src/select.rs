@@ -8,11 +8,12 @@ pub struct SelectionInput {
     pub snapshot_id: Option<String>,
     pub hunks: Vec<HunkSelector>,
     pub change_ids: Vec<String>,
+    pub change_keys: Vec<String>,
 }
 
 impl SelectionInput {
     pub fn has_selectors(&self) -> bool {
-        !self.hunks.is_empty() || !self.change_ids.is_empty()
+        !self.hunks.is_empty() || !self.change_ids.is_empty() || !self.change_keys.is_empty()
     }
 }
 
@@ -74,6 +75,7 @@ impl HunkSelector {
 pub struct ResolvedSelection {
     pub selected_hunks: Vec<String>,
     pub selected_changes: Vec<String>,
+    pub selected_change_keys: Vec<String>,
     pub selected_line_ranges: Vec<String>,
     pub per_file_change_indexes: Vec<(usize, Vec<usize>)>,
 }
@@ -91,6 +93,7 @@ pub fn resolve_selection(
 
     let mut selected_hunks = Vec::new();
     let mut selected_changes = BTreeSet::new();
+    let mut selected_change_keys = Vec::new();
     let mut selected_line_ranges = Vec::new();
 
     for selector in &input.hunks {
@@ -186,6 +189,25 @@ pub fn resolve_selection(
         }
     }
 
+    for change_key in &input.change_keys {
+        let mut found = false;
+        for (file_index, file) in state.files.iter().enumerate() {
+            for (change_index, change) in file.changes.iter().enumerate() {
+                if change.change_key == *change_key {
+                    found = true;
+                    selected_change_keys.push(change_key.clone());
+                    selected_changes.insert((file_index, change_index));
+                }
+            }
+        }
+        if !found {
+            return Err(AppError::new(
+                "unknown_change_key",
+                format!("unknown change key '{}'", change_key),
+            ));
+        }
+    }
+
     let per_file_change_indexes = state
         .files
         .iter()
@@ -208,6 +230,7 @@ pub fn resolve_selection(
     Ok(ResolvedSelection {
         selected_hunks,
         selected_changes: selected_change_ids,
+        selected_change_keys,
         selected_line_ranges,
         per_file_change_indexes,
     })

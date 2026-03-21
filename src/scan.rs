@@ -1,10 +1,12 @@
+use std::collections::BTreeMap;
+
 use crate::cli::Mode;
 use crate::diff::{ParsedHunk, ParsedPatch, parse_patch};
 use crate::error::{AppError, AppResult};
 use crate::git;
 use crate::model::{
-    ChangeState, ChangeView, FileState, FileView, HunkState, HunkView, ScanState, SnapshotView,
-    UnsupportedPath,
+    ChangeState, ChangeView, FileState, FileView, HunkState, HunkView, LineKind, PatchLine,
+    ScanState, SnapshotView, UnsupportedPath,
 };
 
 pub fn scan_repo(repo_root: &std::path::Path, mode: Mode) -> AppResult<ScanState> {
@@ -108,6 +110,7 @@ pub fn scan_repo(repo_root: &std::path::Path, mode: Mode) -> AppResult<ScanState
                                     .collect::<Vec<_>>();
                                 ChangeView {
                                     id: change.id.clone(),
+                                    change_key: change.change_key.clone(),
                                     header: change.header.clone(),
                                     old_start: change.old_start,
                                     old_lines: change.old_lines,
@@ -172,6 +175,7 @@ fn scan_path(
         hunks[hunk_index].change_indexes.push(change_index);
         changes.push(ChangeState {
             id: String::new(),
+            change_key: String::new(),
             header: minimal_hunk.header,
             old_start: minimal_hunk.old_start,
             old_lines: minimal_hunk.old_lines,
@@ -180,6 +184,8 @@ fn scan_path(
             lines: minimal_hunk.lines,
         });
     }
+
+    assign_change_keys(path, display.status, &hunks, &mut changes);
 
     Ok(FileState {
         path: path.to_string(),
@@ -274,4 +280,102 @@ fn render_raw_lines(lines: &[crate::model::PatchLine]) -> String {
 fn short_id(prefix: &str, material: &str) -> String {
     let digest = blake3::hash(material.as_bytes()).to_hex().to_string();
     format!("{}_{}", prefix, &digest[..12])
+}
+
+fn assign_change_keys(
+    path: &str,
+    status: crate::model::FileStatus,
+    hunks: &[HunkState],
+    changes: &mut [ChangeState],
+) {
+    let mut counts = BTreeMap::<String, usize>::new();
+
+    for hunk in hunks {
+        for change_index in &hunk.change_indexes {
+            let base = stable_change_key(path, status, hunk, &changes[*change_index]);
+            let entry = counts.entry(base.clone()).or_insert(0);
+            *entry += 1;
+            changes[*change_index].change_key = if *entry == 1 {
+                base
+            } else {
+                format!("{}-{}", base, *entry)
+            };
+        }
+    }
+}
+
+fn stable_change_key(
+    path: &str,
+    status: crate::model::FileStatus,
+    hunk: &HunkState,
+    change: &ChangeState,
+) -> String {
+    let (before, after) = surrounding_context(hunk, change);
+    let material = format!(
+        "path:{}\nstatus:{}\nbefore:{}\nchange:{}\nafter:{}\ncounts:{}:{}",
+        path,
+        status.as_str(),
+        before.join("\n"),
+        render_raw_lines(&change.lines),
+        after.join("\n"),
+        change.old_lines,
+        change.new_lines
+    );
+    short_id("ck", &material)
+}
+
+fn surrounding_context(hunk: &HunkState, change: &ChangeState) -> (Vec<String>, Vec<String>) {
+    let Some((start, end)) = locate_change_lines(&hunk.lines, change) else {
+        return (Vec::new(), Vec::new());
+    };
+
+    let before = hunk.lines[..start]
+        .iter()
+        .rev()
+        .filter(|line| line.view.kind == LineKind::Context)
+        .take(2)
+        .map(|line| line.view.text.clone())
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let after = hunk.lines[end + 1..]
+        .iter()
+        .filter(|line| line.view.kind == LineKind::Context)
+        .take(2)
+        .map(|line| line.view.text.clone())
+        .collect();
+    (before, after)
+}
+
+fn locate_change_lines(hunk_lines: &[PatchLine], change: &ChangeState) -> Option<(usize, usize)> {
+    let change_lines = &change.lines;
+    if change_lines.is_empty() || change_lines.len() > hunk_lines.len() {
+        return None;
+    }
+
+    let expected_old = change.lines.iter().find_map(|line| line.view.old_lineno);
+    let expected_new = change.lines.iter().find_map(|line| line.view.new_lineno);
+
+    hunk_lines
+        .windows(change_lines.len())
+        .position(|window| {
+            let raws_match = window
+                .iter()
+                .zip(change_lines.iter())
+                .all(|(left, right)| left.raw == right.raw);
+            let old_matches = expected_old
+                .map(|expected| {
+                    window.iter().find_map(|line| line.view.old_lineno) == Some(expected)
+                })
+                .unwrap_or(true);
+            let new_matches = expected_new
+                .map(|expected| {
+                    window.iter().find_map(|line| line.view.new_lineno) == Some(expected)
+                })
+                .unwrap_or(true);
+
+            raws_match && old_matches && new_matches
+        })
+        .map(|start| (start, start + change_lines.len() - 1))
 }
