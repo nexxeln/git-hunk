@@ -190,9 +190,11 @@ jobs:
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           gh release create "v$VERSION" \
+            --repo "$GH_REPO" \
             --title "v$VERSION" \
             --target "$GITHUB_SHA" \
             --generate-notes \
