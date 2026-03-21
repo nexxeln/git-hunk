@@ -2,6 +2,22 @@ use serde::{Deserialize, Serialize};
 
 use crate::cli::Mode;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LineSide {
+    Old,
+    New,
+}
+
+impl LineSide {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LineSide::Old => "old",
+            LineSide::New => "new",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FileStatus {
@@ -123,8 +139,18 @@ pub struct SelectionPlan {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PlanSelector {
-    Hunk { id: String },
-    Change { id: String },
+    Hunk {
+        id: String,
+    },
+    Change {
+        id: String,
+    },
+    LineRange {
+        hunk_id: String,
+        side: LineSide,
+        start: u32,
+        end: u32,
+    },
 }
 
 #[derive(Debug, Clone)]

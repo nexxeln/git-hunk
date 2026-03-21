@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use cli::{Cli, Command, CommitArgs, MutateArgs, ScanArgs, ShowArgs};
 use error::{AppError, AppResult};
 use model::{ChangeView, HunkView, ScanState, SelectionPlan, SnapshotView};
-use select::SelectionInput;
+use select::{HunkSelector, SelectionInput};
 use serde::Serialize;
 
 pub use error::AppError as Error;
@@ -87,6 +87,7 @@ fn mutate_command(
         mode,
         selected_hunks: resolved.selected_hunks,
         selected_changes: resolved.selected_changes,
+        selected_line_ranges: resolved.selected_line_ranges,
         snapshot: next_state.snapshot,
     }))
 }
@@ -102,6 +103,7 @@ fn commit_command(repo_root: &PathBuf, args: CommitArgs) -> AppResult<CommandOut
     let selection = load_selection_input(args.snapshot, args.plan, args.hunks, args.changes)?;
     let mut selected_hunks = Vec::new();
     let mut selected_changes = Vec::new();
+    let mut selected_line_ranges = Vec::new();
 
     if selection.has_selectors() {
         let state = validate_snapshot(repo_root, cli::Mode::Stage, &selection)?;
@@ -110,6 +112,7 @@ fn commit_command(repo_root: &PathBuf, args: CommitArgs) -> AppResult<CommandOut
         git::apply_patch(repo_root, &patch, false)?;
         selected_hunks = resolved.selected_hunks;
         selected_changes = resolved.selected_changes;
+        selected_line_ranges = resolved.selected_line_ranges;
     } else if let Some(snapshot_id) = selection.snapshot_id.as_ref() {
         let state = scan::scan_repo(repo_root, cli::Mode::Stage)?;
         if state.snapshot.snapshot_id != *snapshot_id {
@@ -138,6 +141,7 @@ fn commit_command(repo_root: &PathBuf, args: CommitArgs) -> AppResult<CommandOut
         snapshot_id: next_state.snapshot.snapshot_id.clone(),
         selected_hunks,
         selected_changes,
+        selected_line_ranges,
         snapshot: next_state.snapshot,
     }))
 }
@@ -177,7 +181,10 @@ fn load_selection_input(
 ) -> AppResult<SelectionInput> {
     let mut input = SelectionInput {
         snapshot_id: snapshot,
-        hunk_ids: hunks,
+        hunks: hunks
+            .into_iter()
+            .map(|raw| HunkSelector::parse(&raw))
+            .collect::<AppResult<Vec<_>>>()?,
         change_ids: changes,
     };
 
@@ -200,8 +207,21 @@ fn load_selection_input(
         }
         for selector in plan.selectors {
             match selector {
-                model::PlanSelector::Hunk { id } => input.hunk_ids.push(id),
+                model::PlanSelector::Hunk { id } => input.hunks.push(HunkSelector::Whole { id }),
                 model::PlanSelector::Change { id } => input.change_ids.push(id),
+                model::PlanSelector::LineRange {
+                    hunk_id,
+                    side,
+                    start,
+                    end,
+                } => input
+                    .hunks
+                    .push(HunkSelector::LineRange(select::LineRangeSelector {
+                        hunk_id,
+                        side,
+                        start,
+                        end,
+                    })),
             }
         }
     }
@@ -272,7 +292,7 @@ impl ShowResponse {
                 let mut out = format!("{} {}\n", path, hunk.id);
                 out.push_str(&format!("{}\n", hunk.header));
                 for line in &hunk.lines {
-                    out.push_str(&format!("{}\n", line.render()));
+                    out.push_str(&format!("{}\n", render_numbered_line(line)));
                 }
                 out.trim_end().to_string()
             }
@@ -280,12 +300,24 @@ impl ShowResponse {
                 let mut out = format!("{} {}\n", path, change.id);
                 out.push_str(&format!("{}\n", change.header));
                 for line in &change.lines {
-                    out.push_str(&format!("{}\n", line.render()));
+                    out.push_str(&format!("{}\n", render_numbered_line(line)));
                 }
                 out.trim_end().to_string()
             }
         }
     }
+}
+
+fn render_numbered_line(line: &model::DiffLineView) -> String {
+    let old = line
+        .old_lineno
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let new = line
+        .new_lineno
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    format!("{:>4} {:>4} {}", old, new, line.render())
 }
 
 #[derive(Debug, Serialize)]
@@ -295,16 +327,18 @@ pub struct MutationResponse {
     pub mode: cli::Mode,
     pub selected_hunks: Vec<String>,
     pub selected_changes: Vec<String>,
+    pub selected_line_ranges: Vec<String>,
     pub snapshot: SnapshotView,
 }
 
 impl MutationResponse {
     fn to_text(&self) -> String {
         format!(
-            "{}d {} hunks and {} changes\nnext snapshot: {}",
+            "{}d {} hunks, {} changes, and {} line ranges\nnext snapshot: {}",
             self.action,
             self.selected_hunks.len(),
             self.selected_changes.len(),
+            self.selected_line_ranges.len(),
             self.snapshot_id
         )
     }
@@ -316,14 +350,19 @@ pub struct CommitResponse {
     pub snapshot_id: String,
     pub selected_hunks: Vec<String>,
     pub selected_changes: Vec<String>,
+    pub selected_line_ranges: Vec<String>,
     pub snapshot: SnapshotView,
 }
 
 impl CommitResponse {
     fn to_text(&self) -> String {
         format!(
-            "committed {}\nnext snapshot: {}",
-            self.commit, self.snapshot_id
+            "committed {} using {} hunks, {} changes, and {} line ranges\nnext snapshot: {}",
+            self.commit,
+            self.selected_hunks.len(),
+            self.selected_changes.len(),
+            self.selected_line_ranges.len(),
+            self.snapshot_id
         )
     }
 }
