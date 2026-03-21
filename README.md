@@ -27,7 +27,7 @@ curl -fsSL https://raw.githubusercontent.com/nexxeln/git-hunk/main/install.sh | 
 Install a specific version:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/nexxeln/git-hunk/main/install.sh | GIT_HUNK_VERSION=0.1.0 sh
+curl -fsSL https://raw.githubusercontent.com/nexxeln/git-hunk/main/install.sh | GIT_HUNK_VERSION=0.1.1 sh
 ```
 
 The installer currently supports:
