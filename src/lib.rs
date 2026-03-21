@@ -4,12 +4,13 @@ mod error;
 mod git;
 mod model;
 mod patch;
+mod resolve;
 mod scan;
 mod select;
 
 use std::path::PathBuf;
 
-use cli::{Cli, Command, CommitArgs, MutateArgs, ScanArgs, ShowArgs};
+use cli::{Cli, Command, CommitArgs, MutateArgs, ResolveArgs, ScanArgs, ShowArgs};
 use error::{AppError, AppResult};
 use model::{ChangeView, HunkView, ScanState, SelectionPlan, SnapshotOutput};
 use select::{HunkSelector, SelectionInput};
@@ -23,6 +24,7 @@ pub fn run(cli: Cli) -> AppResult<CommandOutput> {
     match cli.command {
         Command::Scan(args) => scan_command(&repo_root, args),
         Command::Show(args) => show_command(&repo_root, args),
+        Command::Resolve(args) => resolve_command(&repo_root, args),
         Command::Stage(args) => mutate_command(&repo_root, args, false),
         Command::Unstage(args) => mutate_command(&repo_root, args, true),
         Command::Commit(args) => commit_command(&repo_root, args),
@@ -64,6 +66,23 @@ fn show_command(repo_root: &PathBuf, args: ShowArgs) -> AppResult<CommandOutput>
         "unknown_id",
         format!("no hunk or change found for id '{}'", args.id),
     ))
+}
+
+fn resolve_command(repo_root: &PathBuf, args: ResolveArgs) -> AppResult<CommandOutput> {
+    let selection = SelectionInput {
+        snapshot_id: Some(args.snapshot),
+        hunks: Vec::new(),
+        change_ids: Vec::new(),
+    };
+    let state = validate_snapshot(repo_root, args.mode, &selection)?;
+    let response = resolve::resolve_region(
+        &state,
+        &args.path,
+        args.start,
+        args.end.unwrap_or(args.start),
+        args.side,
+    )?;
+    Ok(CommandOutput::Resolve(response))
 }
 
 fn mutate_command(
@@ -279,6 +298,7 @@ struct PreparedCommitSelection {
 pub enum CommandOutput {
     Scan(SnapshotOutput),
     Show(ShowResponse),
+    Resolve(resolve::ResolveResponse),
     Mutation(MutationResponse),
     Commit(CommitResponse),
     CommitDryRun(CommitDryRunResponse),
@@ -293,6 +313,7 @@ impl CommandOutput {
         match self {
             CommandOutput::Scan(snapshot) => snapshot.to_text(),
             CommandOutput::Show(show) => show.to_text(),
+            CommandOutput::Resolve(response) => response.to_text(),
             CommandOutput::Mutation(response) => response.to_text(),
             CommandOutput::Commit(response) => response.to_text(),
             CommandOutput::CommitDryRun(response) => response.to_text(),
@@ -308,6 +329,7 @@ impl Serialize for CommandOutput {
         match self {
             CommandOutput::Scan(snapshot) => snapshot.serialize(serializer),
             CommandOutput::Show(show) => show.serialize(serializer),
+            CommandOutput::Resolve(response) => response.serialize(serializer),
             CommandOutput::Mutation(response) => response.serialize(serializer),
             CommandOutput::Commit(response) => response.serialize(serializer),
             CommandOutput::CommitDryRun(response) => response.serialize(serializer),

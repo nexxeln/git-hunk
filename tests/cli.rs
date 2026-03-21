@@ -74,6 +74,225 @@ fn stage_line_range_selects_single_change() {
 }
 
 #[test]
+fn resolve_exact_change_prefers_change_id() {
+    let repo = init_repo();
+    seed_committed_file(repo.path());
+    write_file(
+        repo.path(),
+        "note.txt",
+        "alpha\nbeta-1\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\niota-1\nkappa\n",
+    );
+
+    let scan = cli_json(repo.path(), &["scan", "--mode", "stage", "--json"]);
+    let snapshot = scan["snapshot_id"].as_str().unwrap();
+    let first_change = nth_change_id(&scan, 0);
+
+    let resolved = cli_json(
+        repo.path(),
+        &[
+            "resolve",
+            "--mode",
+            "stage",
+            "--snapshot",
+            snapshot,
+            "--path",
+            "note.txt",
+            "--start",
+            "2",
+            "--json",
+        ],
+    );
+
+    assert_eq!(resolved["status"], "exact");
+    assert_eq!(resolved["matched_side"], "new");
+    assert_eq!(resolved["recommended_change_ids"][0], first_change);
+    assert_eq!(
+        resolved["recommended_hunk_selectors"][0],
+        format!("{}:new:2-2", first_hunk_id_for_path(&scan, "note.txt"))
+    );
+}
+
+#[test]
+fn resolve_partial_hint_expands_to_full_change() {
+    let repo = init_repo();
+    write_file(repo.path(), "pair.txt", "one\ntwo\nthree\nfour\n");
+    git(repo.path(), &["add", "pair.txt"]);
+    git(repo.path(), &["commit", "-m", "pair seed"]);
+
+    write_file(repo.path(), "pair.txt", "one\nTWO\nTHREE\nfour\n");
+
+    let scan = cli_json(repo.path(), &["scan", "--mode", "stage", "--json"]);
+    let snapshot = scan["snapshot_id"].as_str().unwrap();
+    let change_id = nth_change_id(&scan, 0);
+
+    let resolved = cli_json(
+        repo.path(),
+        &[
+            "resolve",
+            "--mode",
+            "stage",
+            "--snapshot",
+            snapshot,
+            "--path",
+            "pair.txt",
+            "--start",
+            "2",
+            "--end",
+            "2",
+            "--json",
+        ],
+    );
+
+    assert_eq!(resolved["status"], "adjusted");
+    assert_eq!(resolved["recommended_change_ids"][0], change_id);
+    assert_eq!(
+        resolved["recommended_hunk_selectors"][0],
+        format!("{}:new:2-3", first_hunk_id_for_path(&scan, "pair.txt"))
+    );
+}
+
+#[test]
+fn resolve_can_recommend_multiple_change_ids() {
+    let repo = init_repo();
+    seed_committed_file(repo.path());
+    write_file(
+        repo.path(),
+        "note.txt",
+        "alpha\nbeta-1\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\niota-1\nkappa\n",
+    );
+
+    let scan = cli_json(repo.path(), &["scan", "--mode", "stage", "--json"]);
+    let snapshot = scan["snapshot_id"].as_str().unwrap();
+
+    let resolved = cli_json(
+        repo.path(),
+        &[
+            "resolve",
+            "--mode",
+            "stage",
+            "--snapshot",
+            snapshot,
+            "--path",
+            "note.txt",
+            "--start",
+            "2",
+            "--end",
+            "9",
+            "--json",
+        ],
+    );
+
+    assert_eq!(resolved["status"], "exact");
+    assert_eq!(
+        resolved["recommended_change_ids"].as_array().unwrap().len(),
+        2
+    );
+}
+
+#[test]
+fn resolve_nearest_change_when_no_overlap_exists() {
+    let repo = init_repo();
+    seed_committed_file(repo.path());
+    write_file(
+        repo.path(),
+        "note.txt",
+        "alpha\nbeta-1\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\niota-1\nkappa\n",
+    );
+
+    let scan = cli_json(repo.path(), &["scan", "--mode", "stage", "--json"]);
+    let snapshot = scan["snapshot_id"].as_str().unwrap();
+    let second_change = nth_change_id(&scan, 1);
+
+    let resolved = cli_json(
+        repo.path(),
+        &[
+            "resolve",
+            "--mode",
+            "stage",
+            "--snapshot",
+            snapshot,
+            "--path",
+            "note.txt",
+            "--start",
+            "8",
+            "--end",
+            "8",
+            "--json",
+        ],
+    );
+
+    assert_eq!(resolved["status"], "nearest");
+    assert_eq!(resolved["recommended_change_ids"][0], second_change);
+}
+
+#[test]
+fn resolve_auto_uses_old_side_for_deletions() {
+    let repo = init_repo();
+    write_file(repo.path(), "note.txt", "alpha\nbeta\ngamma\n");
+    git(repo.path(), &["add", "note.txt"]);
+    git(repo.path(), &["commit", "-m", "seed delete"]);
+
+    write_file(repo.path(), "note.txt", "alpha\ngamma\n");
+
+    let scan = cli_json(repo.path(), &["scan", "--mode", "stage", "--json"]);
+    let snapshot = scan["snapshot_id"].as_str().unwrap();
+
+    let resolved = cli_json(
+        repo.path(),
+        &[
+            "resolve",
+            "--mode",
+            "stage",
+            "--snapshot",
+            snapshot,
+            "--path",
+            "note.txt",
+            "--start",
+            "2",
+            "--json",
+        ],
+    );
+
+    assert_eq!(resolved["matched_side"], "old");
+    assert_eq!(resolved["status"], "exact");
+}
+
+#[test]
+fn resolve_rejects_unknown_path() {
+    let repo = init_repo();
+    seed_committed_file(repo.path());
+    write_file(
+        repo.path(),
+        "note.txt",
+        "alpha\nbeta-1\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\niota\nkappa\n",
+    );
+
+    let scan = cli_json(repo.path(), &["scan", "--mode", "stage", "--json"]);
+    let snapshot = scan["snapshot_id"].as_str().unwrap();
+
+    let output = cli_output(
+        repo.path(),
+        &[
+            "resolve",
+            "--mode",
+            "stage",
+            "--snapshot",
+            snapshot,
+            "--path",
+            "missing.txt",
+            "--start",
+            "1",
+            "--json",
+        ],
+    );
+    assert!(!output.status.success());
+
+    let err: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(err["error"]["code"], "unknown_path");
+    assert_eq!(err["error"]["category"], "selector");
+}
+
+#[test]
 fn compact_scan_summarizes_changes_for_agents() {
     let repo = init_repo();
     seed_committed_file(repo.path());
@@ -546,13 +765,17 @@ fn first_hunk_id_for_path(scan: &Value, path: &str) -> String {
 }
 
 fn first_change_id(scan: &Value) -> String {
+    nth_change_id(scan, 0)
+}
+
+fn nth_change_id(scan: &Value, index: usize) -> String {
     scan["files"]
         .as_array()
         .unwrap()
         .iter()
         .flat_map(|file| file["hunks"].as_array().unwrap().iter())
         .flat_map(|hunk| hunk["changes"].as_array().unwrap().iter())
-        .next()
+        .nth(index)
         .and_then(|change| change["id"].as_str())
         .unwrap()
         .to_string()

@@ -78,10 +78,14 @@ fn classify(code: &str) -> (ErrorCategory, bool) {
     match code {
         "missing_snapshot" | "stale_snapshot" => (ErrorCategory::Snapshot, true),
         "invalid_hunk_selector"
+        | "invalid_resolve_range"
         | "missing_selection"
         | "unknown_hunk"
         | "unknown_change"
         | "unknown_id"
+        | "unknown_path"
+        | "no_changes_in_path"
+        | "no_resolve_candidates"
         | "ambiguous_line_range"
         | "empty_line_range" => (ErrorCategory::Selector, false),
         "binary_file" | "unsupported_diff" | "empty_diff" | "non_utf8_diff" => {
