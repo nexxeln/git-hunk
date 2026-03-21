@@ -4,7 +4,7 @@ use std::process::{Command, Output};
 
 use assert_cmd::cargo::CommandCargoExt;
 use serde_json::Value;
-use tempfile::TempDir;
+use tempfile::{NamedTempFile, TempDir};
 
 #[test]
 fn stage_change_only_updates_selected_block() {
@@ -42,6 +42,38 @@ fn stage_change_only_updates_selected_block() {
 }
 
 #[test]
+fn stage_line_range_selects_single_change() {
+    let repo = init_repo();
+    seed_committed_file(repo.path());
+    write_file(
+        repo.path(),
+        "note.txt",
+        "alpha\nbeta-1\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\niota-1\nkappa\n",
+    );
+
+    let scan = cli_json(repo.path(), &["scan", "--mode", "stage", "--json"]);
+    let snapshot = scan["snapshot_id"].as_str().unwrap();
+    let hunk_id = first_hunk_id_for_path(&scan, "note.txt");
+    let selector = format!("{}:new:2-2", hunk_id);
+
+    let _stage = cli_json(
+        repo.path(),
+        &[
+            "stage",
+            "--snapshot",
+            snapshot,
+            "--hunk",
+            &selector,
+            "--json",
+        ],
+    );
+
+    let staged = git_stdout(repo.path(), &["diff", "--cached", "--", "note.txt"]);
+    assert!(staged.contains("beta-1"));
+    assert!(!staged.contains("iota-1"));
+}
+
+#[test]
 fn unstage_change_only_removes_selected_block() {
     let repo = init_repo();
     seed_committed_file(repo.path());
@@ -75,6 +107,39 @@ fn unstage_change_only_removes_selected_block() {
     let unstaged = git_stdout(repo.path(), &["diff", "--", "note.txt"]);
     assert!(unstaged.contains("beta-1"));
     assert!(!unstaged.contains("iota-1"));
+}
+
+#[test]
+fn unstage_line_range_selects_single_change_on_old_side() {
+    let repo = init_repo();
+    seed_committed_file(repo.path());
+    write_file(
+        repo.path(),
+        "note.txt",
+        "alpha\nbeta-1\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\niota-1\nkappa\n",
+    );
+    git(repo.path(), &["add", "note.txt"]);
+
+    let scan = cli_json(repo.path(), &["scan", "--mode", "unstage", "--json"]);
+    let snapshot = scan["snapshot_id"].as_str().unwrap();
+    let hunk_id = first_hunk_id_for_path(&scan, "note.txt");
+    let selector = format!("{}:old:2-2", hunk_id);
+
+    let _unstage = cli_json(
+        repo.path(),
+        &[
+            "unstage",
+            "--snapshot",
+            snapshot,
+            "--hunk",
+            &selector,
+            "--json",
+        ],
+    );
+
+    let staged = git_stdout(repo.path(), &["diff", "--cached", "--", "note.txt"]);
+    assert!(!staged.contains("beta-1"));
+    assert!(staged.contains("iota-1"));
 }
 
 #[test]
@@ -153,6 +218,107 @@ fn commit_stages_selection_before_writing_commit() {
     let remaining = git_stdout(repo.path(), &["diff", "--", "note.txt"]);
     assert!(!remaining.contains("beta-1"));
     assert!(remaining.contains("iota-1"));
+}
+
+#[test]
+fn commit_line_range_stages_selection_before_writing_commit() {
+    let repo = init_repo();
+    seed_committed_file(repo.path());
+    write_file(
+        repo.path(),
+        "note.txt",
+        "alpha\nbeta-1\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\niota-1\nkappa\n",
+    );
+
+    let scan = cli_json(repo.path(), &["scan", "--mode", "stage", "--json"]);
+    let snapshot = scan["snapshot_id"].as_str().unwrap();
+    let hunk_id = first_hunk_id_for_path(&scan, "note.txt");
+    let selector = format!("{}:new:9-9", hunk_id);
+
+    let commit = cli_json(
+        repo.path(),
+        &[
+            "commit",
+            "-m",
+            "pick ranged block",
+            "--snapshot",
+            snapshot,
+            "--hunk",
+            &selector,
+            "--json",
+        ],
+    );
+    assert!(commit["commit"].as_str().unwrap().len() >= 7);
+    assert_eq!(commit["selected_line_ranges"][0], selector);
+
+    let commit_diff = git_stdout(repo.path(), &["diff", "HEAD~1..HEAD", "--", "note.txt"]);
+    assert!(!commit_diff.contains("beta-1"));
+    assert!(commit_diff.contains("iota-1"));
+}
+
+#[test]
+fn line_range_rejects_partial_change_overlap() {
+    let repo = init_repo();
+    write_file(repo.path(), "pair.txt", "one\ntwo\nthree\nfour\n");
+    git(repo.path(), &["add", "pair.txt"]);
+    git(repo.path(), &["commit", "-m", "pair seed"]);
+
+    write_file(repo.path(), "pair.txt", "one\nTWO\nTHREE\nfour\n");
+
+    let scan = cli_json(repo.path(), &["scan", "--mode", "stage", "--json"]);
+    let snapshot = scan["snapshot_id"].as_str().unwrap();
+    let hunk_id = first_hunk_id_for_path(&scan, "pair.txt");
+    let selector = format!("{}:new:2-2", hunk_id);
+
+    let output = cli_output(
+        repo.path(),
+        &[
+            "stage",
+            "--snapshot",
+            snapshot,
+            "--hunk",
+            &selector,
+            "--json",
+        ],
+    );
+    assert!(!output.status.success());
+
+    let err: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(err["error"]["code"], "ambiguous_line_range");
+}
+
+#[test]
+fn plan_file_can_select_line_range() {
+    let repo = init_repo();
+    seed_committed_file(repo.path());
+    write_file(
+        repo.path(),
+        "note.txt",
+        "alpha\nbeta-1\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\niota-1\nkappa\n",
+    );
+
+    let scan = cli_json(repo.path(), &["scan", "--mode", "stage", "--json"]);
+    let snapshot = scan["snapshot_id"].as_str().unwrap();
+    let hunk_id = first_hunk_id_for_path(&scan, "note.txt");
+    let plan_file = NamedTempFile::new().unwrap();
+    let plan_path = plan_file.path();
+    fs::write(
+        plan_path,
+        format!(
+            "{{\n  \"snapshot_id\": \"{}\",\n  \"selectors\": [\n    {{\n      \"type\": \"line_range\",\n      \"hunk_id\": \"{}\",\n      \"side\": \"new\",\n      \"start\": 2,\n      \"end\": 2\n    }}\n  ]\n}}\n",
+            snapshot, hunk_id
+        ),
+    )
+    .unwrap();
+
+    let _stage = cli_json(
+        repo.path(),
+        &["stage", "--plan", plan_path.to_str().unwrap(), "--json"],
+    );
+
+    let staged = git_stdout(repo.path(), &["diff", "--cached", "--", "note.txt"]);
+    assert!(staged.contains("beta-1"));
+    assert!(!staged.contains("iota-1"));
 }
 
 #[test]
@@ -246,6 +412,17 @@ fn write_bytes(repo: &Path, path: &str, contents: &[u8]) {
 fn first_hunk_id(scan: &Value) -> String {
     scan["files"][0]["hunks"][0]["id"]
         .as_str()
+        .unwrap()
+        .to_string()
+}
+
+fn first_hunk_id_for_path(scan: &Value, path: &str) -> String {
+    scan["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|file| file["path"] == path)
+        .and_then(|file| file["hunks"][0]["id"].as_str())
         .unwrap()
         .to_string()
 }
