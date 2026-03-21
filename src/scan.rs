@@ -101,6 +101,11 @@ pub fn scan_repo(repo_root: &std::path::Path, mode: Mode) -> AppResult<ScanState
                             .iter()
                             .map(|index| {
                                 let change = &file.changes[*index];
+                                let lines = change
+                                    .lines
+                                    .iter()
+                                    .map(|line| line.view.clone())
+                                    .collect::<Vec<_>>();
                                 ChangeView {
                                     id: change.id.clone(),
                                     header: change.header.clone(),
@@ -108,11 +113,8 @@ pub fn scan_repo(repo_root: &std::path::Path, mode: Mode) -> AppResult<ScanState
                                     old_lines: change.old_lines,
                                     new_start: change.new_start,
                                     new_lines: change.new_lines,
-                                    lines: change
-                                        .lines
-                                        .iter()
-                                        .map(|line| line.view.clone())
-                                        .collect(),
+                                    metadata: crate::model::ChangeMetadata::from_lines(&lines),
+                                    lines,
                                 }
                             })
                             .collect(),

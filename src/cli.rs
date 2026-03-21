@@ -53,6 +53,8 @@ pub struct ScanArgs {
     #[arg(long, value_enum)]
     pub mode: Mode,
     #[arg(long)]
+    pub compact: bool,
+    #[arg(long)]
     pub json: bool,
 }
 
@@ -76,6 +78,8 @@ pub struct MutateArgs {
     #[arg(long = "change")]
     pub changes: Vec<String>,
     #[arg(long)]
+    pub compact: bool,
+    #[arg(long)]
     pub json: bool,
 }
 
@@ -93,6 +97,10 @@ pub struct CommitArgs {
     pub changes: Vec<String>,
     #[arg(long)]
     pub allow_empty: bool,
+    #[arg(long)]
+    pub dry_run: bool,
+    #[arg(long)]
+    pub compact: bool,
     #[arg(long)]
     pub json: bool,
 }

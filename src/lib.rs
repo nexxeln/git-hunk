@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use cli::{Cli, Command, CommitArgs, MutateArgs, ScanArgs, ShowArgs};
 use error::{AppError, AppResult};
-use model::{ChangeView, HunkView, ScanState, SelectionPlan, SnapshotView};
+use model::{ChangeView, HunkView, ScanState, SelectionPlan, SnapshotOutput};
 use select::{HunkSelector, SelectionInput};
 use serde::Serialize;
 
@@ -31,7 +31,10 @@ pub fn run(cli: Cli) -> AppResult<CommandOutput> {
 
 fn scan_command(repo_root: &PathBuf, args: ScanArgs) -> AppResult<CommandOutput> {
     let state = scan::scan_repo(repo_root, args.mode)?;
-    Ok(CommandOutput::Scan(state.snapshot.clone()))
+    Ok(CommandOutput::Scan(SnapshotOutput::from_snapshot(
+        state.snapshot,
+        args.compact,
+    )))
 }
 
 fn show_command(repo_root: &PathBuf, args: ShowArgs) -> AppResult<CommandOutput> {
@@ -88,7 +91,7 @@ fn mutate_command(
         selected_hunks: resolved.selected_hunks,
         selected_changes: resolved.selected_changes,
         selected_line_ranges: resolved.selected_line_ranges,
-        snapshot: next_state.snapshot,
+        snapshot: SnapshotOutput::from_snapshot(next_state.snapshot, args.compact),
     }))
 }
 
@@ -101,29 +104,25 @@ fn commit_command(repo_root: &PathBuf, args: CommitArgs) -> AppResult<CommandOut
     }
 
     let selection = load_selection_input(args.snapshot, args.plan, args.hunks, args.changes)?;
-    let mut selected_hunks = Vec::new();
-    let mut selected_changes = Vec::new();
-    let mut selected_line_ranges = Vec::new();
+    let prepared = prepare_commit_selection(repo_root, &selection)?;
 
-    if selection.has_selectors() {
-        let state = validate_snapshot(repo_root, cli::Mode::Stage, &selection)?;
-        let resolved = select::resolve_selection(&state, &selection)?;
-        let patch = patch::build_patch(&state, &resolved)?;
-        git::apply_patch(repo_root, &patch, false)?;
-        selected_hunks = resolved.selected_hunks;
-        selected_changes = resolved.selected_changes;
-        selected_line_ranges = resolved.selected_line_ranges;
-    } else if let Some(snapshot_id) = selection.snapshot_id.as_ref() {
-        let state = scan::scan_repo(repo_root, cli::Mode::Stage)?;
-        if state.snapshot.snapshot_id != *snapshot_id {
-            return Err(AppError::new(
-                "stale_snapshot",
-                format!(
-                    "snapshot '{}' no longer matches the current stage view '{}'",
-                    snapshot_id, state.snapshot.snapshot_id
-                ),
-            ));
-        }
+    if args.dry_run {
+        let preview = git::preview_commit(repo_root, prepared.patch.as_deref(), args.allow_empty)?;
+        return Ok(CommandOutput::CommitDryRun(CommitDryRunResponse {
+            dry_run: true,
+            snapshot_id: prepared.snapshot_id,
+            messages: args.messages,
+            selected_hunks: prepared.selected_hunks,
+            selected_changes: prepared.selected_changes,
+            selected_line_ranges: prepared.selected_line_ranges,
+            files: preview.files,
+            patch: preview.patch,
+            diffstat: preview.diffstat,
+        }));
+    }
+
+    if let Some(patch) = prepared.patch.as_deref() {
+        git::apply_patch(repo_root, patch, false)?;
     }
 
     if !args.allow_empty && !git::has_staged_changes(repo_root)? {
@@ -139,11 +138,50 @@ fn commit_command(repo_root: &PathBuf, args: CommitArgs) -> AppResult<CommandOut
     Ok(CommandOutput::Commit(CommitResponse {
         commit: commit_sha,
         snapshot_id: next_state.snapshot.snapshot_id.clone(),
-        selected_hunks,
-        selected_changes,
-        selected_line_ranges,
-        snapshot: next_state.snapshot,
+        selected_hunks: prepared.selected_hunks,
+        selected_changes: prepared.selected_changes,
+        selected_line_ranges: prepared.selected_line_ranges,
+        snapshot: SnapshotOutput::from_snapshot(next_state.snapshot, args.compact),
     }))
+}
+
+fn prepare_commit_selection(
+    repo_root: &PathBuf,
+    selection: &SelectionInput,
+) -> AppResult<PreparedCommitSelection> {
+    if selection.has_selectors() {
+        let state = validate_snapshot(repo_root, cli::Mode::Stage, selection)?;
+        let resolved = select::resolve_selection(&state, selection)?;
+        let patch = patch::build_patch(&state, &resolved)?;
+        return Ok(PreparedCommitSelection {
+            snapshot_id: state.snapshot.snapshot_id.clone(),
+            patch: Some(patch),
+            selected_hunks: resolved.selected_hunks,
+            selected_changes: resolved.selected_changes,
+            selected_line_ranges: resolved.selected_line_ranges,
+        });
+    }
+
+    let state = scan::scan_repo(repo_root, cli::Mode::Stage)?;
+    if let Some(snapshot_id) = selection.snapshot_id.as_ref() {
+        if state.snapshot.snapshot_id != *snapshot_id {
+            return Err(AppError::new(
+                "stale_snapshot",
+                format!(
+                    "snapshot '{}' no longer matches the current stage view '{}'",
+                    snapshot_id, state.snapshot.snapshot_id
+                ),
+            ));
+        }
+    }
+
+    Ok(PreparedCommitSelection {
+        snapshot_id: state.snapshot.snapshot_id,
+        patch: None,
+        selected_hunks: Vec::new(),
+        selected_changes: Vec::new(),
+        selected_line_ranges: Vec::new(),
+    })
 }
 
 fn validate_snapshot(
@@ -216,7 +254,7 @@ fn load_selection_input(
                     end,
                 } => input
                     .hunks
-                    .push(HunkSelector::LineRange(select::LineRangeSelector {
+                    .push(select::HunkSelector::LineRange(select::LineRangeSelector {
                         hunk_id,
                         side,
                         start,
@@ -229,12 +267,21 @@ fn load_selection_input(
     Ok(input)
 }
 
+struct PreparedCommitSelection {
+    snapshot_id: String,
+    patch: Option<String>,
+    selected_hunks: Vec<String>,
+    selected_changes: Vec<String>,
+    selected_line_ranges: Vec<String>,
+}
+
 #[derive(Debug)]
 pub enum CommandOutput {
-    Scan(SnapshotView),
+    Scan(SnapshotOutput),
     Show(ShowResponse),
     Mutation(MutationResponse),
     Commit(CommitResponse),
+    CommitDryRun(CommitDryRunResponse),
 }
 
 impl CommandOutput {
@@ -248,6 +295,7 @@ impl CommandOutput {
             CommandOutput::Show(show) => show.to_text(),
             CommandOutput::Mutation(response) => response.to_text(),
             CommandOutput::Commit(response) => response.to_text(),
+            CommandOutput::CommitDryRun(response) => response.to_text(),
         }
     }
 }
@@ -262,6 +310,7 @@ impl Serialize for CommandOutput {
             CommandOutput::Show(show) => show.serialize(serializer),
             CommandOutput::Mutation(response) => response.serialize(serializer),
             CommandOutput::Commit(response) => response.serialize(serializer),
+            CommandOutput::CommitDryRun(response) => response.serialize(serializer),
         }
     }
 }
@@ -298,7 +347,14 @@ impl ShowResponse {
             }
             ShowResponse::Change { path, change, .. } => {
                 let mut out = format!("{} {}\n", path, change.id);
-                out.push_str(&format!("{}\n", change.header));
+                out.push_str(&format!(
+                    "{} [{} +{} -{} {}]\n",
+                    change.header,
+                    change.metadata.kind.as_str(),
+                    change.metadata.added_lines,
+                    change.metadata.deleted_lines,
+                    change.metadata.preview
+                ));
                 for line in &change.lines {
                     out.push_str(&format!("{}\n", render_numbered_line(line)));
                 }
@@ -328,7 +384,7 @@ pub struct MutationResponse {
     pub selected_hunks: Vec<String>,
     pub selected_changes: Vec<String>,
     pub selected_line_ranges: Vec<String>,
-    pub snapshot: SnapshotView,
+    pub snapshot: SnapshotOutput,
 }
 
 impl MutationResponse {
@@ -351,7 +407,7 @@ pub struct CommitResponse {
     pub selected_hunks: Vec<String>,
     pub selected_changes: Vec<String>,
     pub selected_line_ranges: Vec<String>,
-    pub snapshot: SnapshotView,
+    pub snapshot: SnapshotOutput,
 }
 
 impl CommitResponse {
@@ -359,6 +415,32 @@ impl CommitResponse {
         format!(
             "committed {} using {} hunks, {} changes, and {} line ranges\nnext snapshot: {}",
             self.commit,
+            self.selected_hunks.len(),
+            self.selected_changes.len(),
+            self.selected_line_ranges.len(),
+            self.snapshot_id
+        )
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct CommitDryRunResponse {
+    pub dry_run: bool,
+    pub snapshot_id: String,
+    pub messages: Vec<String>,
+    pub selected_hunks: Vec<String>,
+    pub selected_changes: Vec<String>,
+    pub selected_line_ranges: Vec<String>,
+    pub files: Vec<String>,
+    pub patch: String,
+    pub diffstat: String,
+}
+
+impl CommitDryRunResponse {
+    fn to_text(&self) -> String {
+        format!(
+            "would commit {} files using {} hunks, {} changes, and {} line ranges\nsnapshot: {}",
+            self.files.len(),
             self.selected_hunks.len(),
             self.selected_changes.len(),
             self.selected_line_ranges.len(),

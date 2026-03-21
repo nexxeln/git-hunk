@@ -74,6 +74,34 @@ fn stage_line_range_selects_single_change() {
 }
 
 #[test]
+fn compact_scan_summarizes_changes_for_agents() {
+    let repo = init_repo();
+    seed_committed_file(repo.path());
+    write_file(
+        repo.path(),
+        "note.txt",
+        "alpha\nbeta-1\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\niota-1\nkappa\n",
+    );
+
+    let scan = cli_json(
+        repo.path(),
+        &["scan", "--mode", "stage", "--compact", "--json"],
+    );
+    let change = &scan["files"][0]["hunks"][0]["changes"][0];
+
+    assert!(change.get("lines").is_none());
+    assert_eq!(change["metadata"]["kind"], "replacement");
+    assert_eq!(change["metadata"]["added_lines"], 1);
+    assert_eq!(change["metadata"]["deleted_lines"], 1);
+    assert!(
+        change["metadata"]["preview"]
+            .as_str()
+            .unwrap()
+            .contains("beta")
+    );
+}
+
+#[test]
 fn unstage_change_only_removes_selected_block() {
     let repo = init_repo();
     seed_committed_file(repo.path());
@@ -177,6 +205,8 @@ fn stale_snapshot_is_rejected() {
 
     let err: Value = serde_json::from_slice(&output.stderr).unwrap();
     assert_eq!(err["error"]["code"], "stale_snapshot");
+    assert_eq!(err["error"]["category"], "snapshot");
+    assert_eq!(err["error"]["retryable"], true);
 }
 
 #[test]
@@ -257,6 +287,92 @@ fn commit_line_range_stages_selection_before_writing_commit() {
 }
 
 #[test]
+fn commit_dry_run_returns_exact_patch_without_mutating_repo() {
+    let repo = init_repo();
+    seed_committed_file(repo.path());
+    write_file(
+        repo.path(),
+        "note.txt",
+        "alpha\nbeta-1\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\niota-1\nkappa\n",
+    );
+
+    let scan = cli_json(repo.path(), &["scan", "--mode", "stage", "--json"]);
+    let snapshot = scan["snapshot_id"].as_str().unwrap();
+    let change_id = first_change_id(&scan);
+    let head_before = git_stdout(repo.path(), &["rev-parse", "HEAD"]);
+
+    let dry_run = cli_json(
+        repo.path(),
+        &[
+            "commit",
+            "-m",
+            "preview selection",
+            "--snapshot",
+            snapshot,
+            "--change",
+            &change_id,
+            "--dry-run",
+            "--json",
+        ],
+    );
+
+    assert_eq!(dry_run["dry_run"], true);
+    assert_eq!(dry_run["files"][0], "note.txt");
+    assert!(dry_run["patch"].as_str().unwrap().contains("beta-1"));
+    assert!(!dry_run["patch"].as_str().unwrap().contains("iota-1"));
+    assert!(dry_run["diffstat"].as_str().unwrap().contains("note.txt"));
+
+    let head_after = git_stdout(repo.path(), &["rev-parse", "HEAD"]);
+    assert_eq!(head_before, head_after);
+
+    let staged = git_stdout(repo.path(), &["diff", "--cached"]);
+    assert!(staged.trim().is_empty());
+
+    let unstaged = git_stdout(repo.path(), &["diff", "--", "note.txt"]);
+    assert!(unstaged.contains("beta-1"));
+    assert!(unstaged.contains("iota-1"));
+}
+
+#[test]
+fn commit_dry_run_includes_already_staged_changes() {
+    let repo = init_repo();
+    seed_committed_file(repo.path());
+    write_file(repo.path(), "staged.txt", "before\nafter\n");
+    git(repo.path(), &["add", "staged.txt"]);
+    write_file(
+        repo.path(),
+        "note.txt",
+        "alpha\nbeta-1\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\niota\nkappa\n",
+    );
+
+    let scan = cli_json(repo.path(), &["scan", "--mode", "stage", "--json"]);
+    let snapshot = scan["snapshot_id"].as_str().unwrap();
+    let change_id = first_change_id(&scan);
+
+    let dry_run = cli_json(
+        repo.path(),
+        &[
+            "commit",
+            "-m",
+            "preview staged and selected",
+            "--snapshot",
+            snapshot,
+            "--change",
+            &change_id,
+            "--dry-run",
+            "--json",
+        ],
+    );
+
+    let files = dry_run["files"].as_array().unwrap();
+    assert!(files.iter().any(|file| file == "note.txt"));
+    assert!(files.iter().any(|file| file == "staged.txt"));
+    let patch = dry_run["patch"].as_str().unwrap();
+    assert!(patch.contains("staged.txt"));
+    assert!(patch.contains("beta-1"));
+}
+
+#[test]
 fn line_range_rejects_partial_change_overlap() {
     let repo = init_repo();
     write_file(repo.path(), "pair.txt", "one\ntwo\nthree\nfour\n");
@@ -285,6 +401,8 @@ fn line_range_rejects_partial_change_overlap() {
 
     let err: Value = serde_json::from_slice(&output.stderr).unwrap();
     assert_eq!(err["error"]["code"], "ambiguous_line_range");
+    assert_eq!(err["error"]["category"], "selector");
+    assert_eq!(err["error"]["retryable"], false);
 }
 
 #[test]
