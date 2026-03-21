@@ -5,6 +5,9 @@ on:
     branches:
       - main
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 permissions:
   contents: write
 
@@ -23,7 +26,7 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -108,7 +111,7 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -131,7 +134,7 @@ jobs:
           shasum -a 256 "dist/${archive}" > "dist/${archive}.sha256"
 
       - name: Upload release artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.target }}
           path: dist/*
@@ -147,7 +150,7 @@ jobs:
 
       - name: Check out repository
         if: ${{ needs.prepare.outputs.published != 'true' }}
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust
         if: ${{ needs.prepare.outputs.published != 'true' }}
@@ -179,7 +182,7 @@ jobs:
 
     steps:
       - name: Download release artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           path: dist
           merge-multiple: true
