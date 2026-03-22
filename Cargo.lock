@@ -248,7 +248,7 @@ dependencies = [
 
 [[package]]
 name = "git-hunk"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "assert_cmd",
  "blake3",
