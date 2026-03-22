@@ -1,6 +1,7 @@
 use std::fs;
+use std::io::Write;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 use assert_cmd::cargo::CommandCargoExt;
 use serde_json::Value;
@@ -495,6 +496,39 @@ fn compact_scan_summarizes_changes_for_agents() {
 }
 
 #[test]
+fn scan_includes_selector_bundles_and_change_key_scheme() {
+    let repo = init_repo();
+    seed_committed_file(repo.path());
+    write_file(
+        repo.path(),
+        "note.txt",
+        "alpha\nbeta-1\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\niota\nkappa\n",
+    );
+
+    let scan = cli_json(repo.path(), &["scan", "--mode", "stage", "--json"]);
+    let hunk = &scan["files"][0]["hunks"][0];
+    let change = &hunk["changes"][0];
+
+    assert_eq!(scan["change_key_scheme"], "v1");
+    assert_eq!(hunk["selectors"]["snapshot_id"], scan["snapshot_id"]);
+    assert_eq!(hunk["selectors"]["selectors"]["hunk"]["type"], "hunk");
+    assert_eq!(change["selectors"]["snapshot_id"], scan["snapshot_id"]);
+    assert_eq!(change["selectors"]["hunk_id"], hunk["id"]);
+    assert_eq!(change["selectors"]["change_id"], change["id"]);
+    assert_eq!(change["selectors"]["change_key"], change["change_key"]);
+    assert_eq!(change["selectors"]["change_key_scheme"], "v1");
+    assert_eq!(
+        change["selectors"]["recommended_selector"]["type"],
+        "change_key"
+    );
+    assert_eq!(change["selectors"]["selectors"]["change"]["type"], "change");
+    assert_eq!(
+        change["selectors"]["selectors"]["new_range"]["type"],
+        "line_range"
+    );
+}
+
+#[test]
 fn unstage_change_only_removes_selected_block() {
     let repo = init_repo();
     seed_committed_file(repo.path());
@@ -600,6 +634,64 @@ fn stale_snapshot_is_rejected() {
     assert_eq!(err["error"]["code"], "stale_snapshot");
     assert_eq!(err["error"]["category"], "snapshot");
     assert_eq!(err["error"]["retryable"], true);
+    assert_eq!(
+        err["error"]["details"]["current_snapshot_id"]
+            .as_str()
+            .unwrap()
+            .len(),
+        14
+    );
+    assert_eq!(err["error"]["details"]["can_apply"], false);
+}
+
+#[test]
+fn stale_snapshot_error_reports_recoverable_change_keys() {
+    let repo = init_repo();
+    seed_committed_file(repo.path());
+    write_file(
+        repo.path(),
+        "note.txt",
+        "alpha\nbeta-1\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\niota\nkappa\n",
+    );
+
+    let scan = cli_json(repo.path(), &["scan", "--mode", "stage", "--json"]);
+    let snapshot = scan["snapshot_id"].as_str().unwrap().to_string();
+    let change_key = change_key_for_path(&scan, "note.txt", 0);
+
+    write_file(repo.path(), "other.txt", "unrelated\n");
+    let rescanned = cli_json(
+        repo.path(),
+        &["scan", "--mode", "stage", "--compact", "--json"],
+    );
+
+    let output = cli_output(
+        repo.path(),
+        &[
+            "stage",
+            "--snapshot",
+            &snapshot,
+            "--change-key",
+            &change_key,
+            "--json",
+        ],
+    );
+    assert!(!output.status.success());
+
+    let err: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(err["error"]["code"], "stale_snapshot");
+    assert_eq!(
+        err["error"]["details"]["current_snapshot_id"],
+        rescanned["snapshot_id"]
+    );
+    assert_eq!(err["error"]["details"]["can_apply"], true);
+    assert_eq!(
+        err["error"]["details"]["resolved_selectors"][0]["type"],
+        "change_key"
+    );
+    assert_eq!(
+        err["error"]["details"]["matched_changes"][0]["change_key"],
+        change_key
+    );
 }
 
 #[test]
@@ -766,6 +858,85 @@ fn commit_dry_run_includes_already_staged_changes() {
 }
 
 #[test]
+fn stage_dry_run_previews_without_mutating_repo() {
+    let repo = init_repo();
+    seed_committed_file(repo.path());
+    write_file(
+        repo.path(),
+        "note.txt",
+        "alpha\nbeta-1\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\niota-1\nkappa\n",
+    );
+
+    let scan = cli_json(repo.path(), &["scan", "--mode", "stage", "--json"]);
+    let snapshot = scan["snapshot_id"].as_str().unwrap();
+    let change_id = first_change_id(&scan);
+
+    let dry_run = cli_json(
+        repo.path(),
+        &[
+            "stage",
+            "--snapshot",
+            snapshot,
+            "--change",
+            &change_id,
+            "--dry-run",
+            "--json",
+        ],
+    );
+
+    assert_eq!(dry_run["action"], "stage");
+    assert_eq!(dry_run["dry_run"], true);
+    assert_eq!(dry_run["files"][0], "note.txt");
+    assert!(dry_run["patch"].as_str().unwrap().contains("beta-1"));
+    assert!(!dry_run["patch"].as_str().unwrap().contains("iota-1"));
+
+    let staged = git_stdout(repo.path(), &["diff", "--cached"]);
+    assert!(staged.trim().is_empty());
+
+    let unstaged = git_stdout(repo.path(), &["diff", "--", "note.txt"]);
+    assert!(unstaged.contains("beta-1"));
+    assert!(unstaged.contains("iota-1"));
+}
+
+#[test]
+fn unstage_dry_run_previews_without_mutating_repo() {
+    let repo = init_repo();
+    seed_committed_file(repo.path());
+    write_file(
+        repo.path(),
+        "note.txt",
+        "alpha\nbeta-1\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\niota-1\nkappa\n",
+    );
+    git(repo.path(), &["add", "note.txt"]);
+
+    let scan = cli_json(repo.path(), &["scan", "--mode", "unstage", "--json"]);
+    let snapshot = scan["snapshot_id"].as_str().unwrap();
+    let change_id = first_change_id(&scan);
+
+    let dry_run = cli_json(
+        repo.path(),
+        &[
+            "unstage",
+            "--snapshot",
+            snapshot,
+            "--change",
+            &change_id,
+            "--dry-run",
+            "--json",
+        ],
+    );
+
+    assert_eq!(dry_run["action"], "unstage");
+    assert_eq!(dry_run["dry_run"], true);
+    assert!(dry_run["patch"].as_str().unwrap().contains("iota-1"));
+    assert!(!dry_run["patch"].as_str().unwrap().contains("beta-1"));
+
+    let staged = git_stdout(repo.path(), &["diff", "--cached", "--", "note.txt"]);
+    assert!(staged.contains("beta-1"));
+    assert!(staged.contains("iota-1"));
+}
+
+#[test]
 fn line_range_rejects_partial_change_overlap() {
     let repo = init_repo();
     write_file(repo.path(), "pair.txt", "one\ntwo\nthree\nfour\n");
@@ -830,6 +1001,164 @@ fn plan_file_can_select_line_range() {
     let staged = git_stdout(repo.path(), &["diff", "--cached", "--", "note.txt"]);
     assert!(staged.contains("beta-1"));
     assert!(!staged.contains("iota-1"));
+}
+
+#[test]
+fn plan_can_be_read_from_stdin() {
+    let repo = init_repo();
+    seed_committed_file(repo.path());
+    write_file(
+        repo.path(),
+        "note.txt",
+        "alpha\nbeta-1\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\niota-1\nkappa\n",
+    );
+
+    let scan = cli_json(repo.path(), &["scan", "--mode", "stage", "--json"]);
+    let snapshot = scan["snapshot_id"].as_str().unwrap();
+    let change_key = change_key_for_path(&scan, "note.txt", 0);
+    let plan = format!(
+        "{{\n  \"snapshot_id\": \"{}\",\n  \"selectors\": [\n    {{ \"type\": \"change_key\", \"key\": \"{}\" }}\n  ]\n}}\n",
+        snapshot, change_key
+    );
+
+    let _stage = cli_json_with_stdin(repo.path(), &["stage", "--plan", "-", "--json"], &plan);
+
+    let staged = git_stdout(repo.path(), &["diff", "--cached", "--", "note.txt"]);
+    assert!(staged.contains("beta-1"));
+    assert!(!staged.contains("iota-1"));
+}
+
+#[test]
+fn validate_recovers_change_keys_against_current_snapshot() {
+    let repo = init_repo();
+    seed_committed_file(repo.path());
+    write_file(
+        repo.path(),
+        "note.txt",
+        "alpha\nbeta-1\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\niota\nkappa\n",
+    );
+
+    let scan = cli_json(repo.path(), &["scan", "--mode", "stage", "--json"]);
+    let snapshot = scan["snapshot_id"].as_str().unwrap().to_string();
+    let change_key = change_key_for_path(&scan, "note.txt", 0);
+
+    write_file(repo.path(), "other.txt", "unrelated\n");
+
+    let validated = cli_json(
+        repo.path(),
+        &[
+            "validate",
+            "--mode",
+            "stage",
+            "--snapshot",
+            &snapshot,
+            "--change-key",
+            &change_key,
+            "--compact",
+            "--json",
+        ],
+    );
+
+    assert_eq!(validated["snapshot_matches"], false);
+    assert_eq!(validated["stale"], true);
+    assert_eq!(validated["directly_usable"], false);
+    assert_eq!(validated["can_apply"], true);
+    assert_eq!(validated["resolved_selectors"][0]["type"], "change_key");
+    assert_eq!(validated["resolved_selectors"][0]["key"], change_key);
+    assert_eq!(validated["matched_changes"][0]["change_key"], change_key);
+    assert_eq!(validated["matched_changes"][0]["change_key_scheme"], "v1");
+    assert_eq!(
+        validated["snapshot"]["snapshot_id"],
+        validated["snapshot_id"]
+    );
+}
+
+#[test]
+fn resolve_includes_recommended_selector_bundles() {
+    let repo = init_repo();
+    seed_committed_file(repo.path());
+    write_file(
+        repo.path(),
+        "note.txt",
+        "alpha\nbeta-1\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\niota-1\nkappa\n",
+    );
+
+    let scan = cli_json(repo.path(), &["scan", "--mode", "stage", "--json"]);
+    let snapshot = scan["snapshot_id"].as_str().unwrap();
+    let change_key = change_key_for_path(&scan, "note.txt", 0);
+
+    let resolved = cli_json(
+        repo.path(),
+        &[
+            "resolve",
+            "--mode",
+            "stage",
+            "--snapshot",
+            snapshot,
+            "--path",
+            "note.txt",
+            "--start",
+            "2",
+            "--json",
+        ],
+    );
+
+    assert_eq!(resolved["change_key_scheme"], "v1");
+    assert_eq!(
+        resolved["recommended_selectors"][0]["change_key"],
+        change_key
+    );
+    assert_eq!(
+        resolved["recommended_selectors"][0]["recommended_selector"]["type"],
+        "change_key"
+    );
+    assert_eq!(
+        resolved["candidates"][0]["selectors"]["change_key"],
+        change_key
+    );
+}
+
+#[test]
+fn change_key_contract_breaks_when_nearby_context_changes() {
+    let repo = init_repo();
+    write_file(
+        repo.path(),
+        "context.txt",
+        "one\nkeep-a\nkeep-b\ntarget\nkeep-c\nkeep-d\nseven\n",
+    );
+    git(repo.path(), &["add", "context.txt"]);
+    git(repo.path(), &["commit", "-m", "context seed"]);
+
+    write_file(
+        repo.path(),
+        "context.txt",
+        "one\nkeep-a\nkeep-b\nTARGET\nkeep-c\nkeep-d\nseven\n",
+    );
+    let scan_before = cli_json(repo.path(), &["scan", "--mode", "stage", "--json"]);
+    let before = change_keys_for_path_with_preview(&scan_before, "context.txt", "TARGET");
+
+    write_file(
+        repo.path(),
+        "context.txt",
+        "one\nKEEP-A\nkeep-b\nTARGET\nkeep-c\nkeep-d\nseven\n",
+    );
+    let scan_after = cli_json(repo.path(), &["scan", "--mode", "stage", "--json"]);
+    let after = change_keys_for_path_with_preview(&scan_after, "context.txt", "TARGET");
+
+    assert_eq!(before.len(), 1);
+    assert_eq!(after.len(), 1);
+    assert_ne!(before[0], after[0]);
+}
+
+#[test]
+fn help_describes_validate_and_agent_loop() {
+    let repo = init_repo();
+    let output = cli_output(repo.path(), &["--help"]);
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("validate  Validate selectors against the current snapshot"));
+    assert!(stdout.contains("Agent loop:"));
 }
 
 #[test]
@@ -1015,6 +1344,17 @@ fn cli_json(repo: &Path, args: &[&str]) -> Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
+fn cli_json_with_stdin(repo: &Path, args: &[&str], input: &str) -> Value {
+    let output = cli_output_with_stdin(repo, args, input);
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
 fn cli_output(repo: &Path, args: &[&str]) -> Output {
     let mut cmd = Command::cargo_bin("git-hunk").unwrap();
     cmd.current_dir(repo);
@@ -1024,6 +1364,28 @@ fn cli_output(repo: &Path, args: &[&str]) -> Output {
     cmd.env("GIT_COMMITTER_NAME", "Test User");
     cmd.env("GIT_COMMITTER_EMAIL", "test@example.com");
     cmd.output().unwrap()
+}
+
+fn cli_output_with_stdin(repo: &Path, args: &[&str], input: &str) -> Output {
+    let mut cmd = Command::cargo_bin("git-hunk").unwrap();
+    cmd.current_dir(repo);
+    cmd.args(args);
+    cmd.env("GIT_AUTHOR_NAME", "Test User");
+    cmd.env("GIT_AUTHOR_EMAIL", "test@example.com");
+    cmd.env("GIT_COMMITTER_NAME", "Test User");
+    cmd.env("GIT_COMMITTER_EMAIL", "test@example.com");
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
 }
 
 fn git(repo: &Path, args: &[&str]) {

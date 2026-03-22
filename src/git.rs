@@ -208,17 +208,27 @@ pub fn preview_commit(
     selection_patch: Option<&str>,
     allow_empty: bool,
 ) -> AppResult<CommitPreview> {
-    let index = prepare_temp_index(repo_root)?;
+    let preview = preview_index(repo_root, selection_patch, false)?;
 
-    if let Some(patch) = selection_patch {
-        apply_patch_with_index(repo_root, patch, false, Some(index.path()))?;
-    }
-
-    if !allow_empty && !has_staged_changes_with_index(repo_root, Some(index.path()))? {
+    if !allow_empty && preview.files.is_empty() {
         return Err(AppError::new(
             "nothing_staged",
             "there are no staged changes to commit".to_string(),
         ));
+    }
+
+    Ok(preview)
+}
+
+pub fn preview_index(
+    repo_root: &Path,
+    selection_patch: Option<&str>,
+    reverse: bool,
+) -> AppResult<CommitPreview> {
+    let index = prepare_temp_index(repo_root)?;
+
+    if let Some(patch) = selection_patch {
+        apply_patch_with_index(repo_root, patch, reverse, Some(index.path()))?;
     }
 
     Ok(CommitPreview {

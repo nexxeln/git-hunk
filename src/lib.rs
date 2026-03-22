@@ -7,10 +7,12 @@ mod patch;
 mod resolve;
 mod scan;
 mod select;
+mod validate;
 
+use std::io::Read;
 use std::path::PathBuf;
 
-use cli::{Cli, Command, CommitArgs, MutateArgs, ResolveArgs, ScanArgs, ShowArgs};
+use cli::{Cli, Command, CommitArgs, MutateArgs, ResolveArgs, ScanArgs, ShowArgs, ValidateArgs};
 use error::{AppError, AppResult};
 use model::{ChangeView, HunkView, ScanState, SelectionPlan, SnapshotOutput};
 use select::{HunkSelector, SelectionInput};
@@ -25,6 +27,7 @@ pub fn run(cli: Cli) -> AppResult<CommandOutput> {
         Command::Scan(args) => scan_command(&repo_root, args),
         Command::Show(args) => show_command(&repo_root, args),
         Command::Resolve(args) => resolve_command(&repo_root, args),
+        Command::Validate(args) => validate_command(&repo_root, args),
         Command::Stage(args) => mutate_command(&repo_root, args, false),
         Command::Unstage(args) => mutate_command(&repo_root, args, true),
         Command::Commit(args) => commit_command(&repo_root, args),
@@ -96,6 +99,22 @@ fn resolve_command(repo_root: &PathBuf, args: ResolveArgs) -> AppResult<CommandO
     Ok(CommandOutput::Resolve(response))
 }
 
+fn validate_command(repo_root: &PathBuf, args: ValidateArgs) -> AppResult<CommandOutput> {
+    let selection = load_selection_input(
+        args.snapshot,
+        args.plan,
+        args.hunks,
+        args.changes,
+        args.change_keys,
+    )?;
+    let state = scan::scan_repo(repo_root, args.mode)?;
+    Ok(CommandOutput::Validate(validate::validate_selection(
+        &state,
+        &selection,
+        args.compact,
+    )))
+}
+
 fn mutate_command(
     repo_root: &PathBuf,
     args: MutateArgs,
@@ -116,6 +135,23 @@ fn mutate_command(
     let state = validate_snapshot(repo_root, mode, &selection)?;
     let resolved = select::resolve_selection(&state, &selection)?;
     let patch = patch::build_patch(&state, &resolved)?;
+
+    if args.dry_run {
+        let preview = git::preview_index(repo_root, Some(&patch), reverse)?;
+        return Ok(CommandOutput::MutationDryRun(MutationDryRunResponse {
+            action: if reverse { "unstage" } else { "stage" },
+            dry_run: true,
+            snapshot_id: state.snapshot.snapshot_id.clone(),
+            mode,
+            selected_hunks: resolved.selected_hunks,
+            selected_changes: resolved.selected_changes,
+            selected_change_keys: resolved.selected_change_keys,
+            selected_line_ranges: resolved.selected_line_ranges,
+            files: preview.files,
+            patch: preview.patch,
+            diffstat: preview.diffstat,
+        }));
+    }
 
     git::apply_patch(repo_root, &patch, reverse)?;
 
@@ -211,12 +247,11 @@ fn prepare_commit_selection(
     let state = scan::scan_repo(repo_root, cli::Mode::Stage)?;
     if let Some(snapshot_id) = selection.snapshot_id.as_ref() {
         if state.snapshot.snapshot_id != *snapshot_id {
-            return Err(AppError::new(
-                "stale_snapshot",
-                format!(
-                    "snapshot '{}' no longer matches the current stage view '{}'",
-                    snapshot_id, state.snapshot.snapshot_id
-                ),
+            return Err(stale_snapshot_error(
+                cli::Mode::Stage,
+                snapshot_id,
+                &state,
+                selection,
             ));
         }
     }
@@ -245,17 +280,38 @@ fn validate_snapshot(
 
     let state = scan::scan_repo(repo_root, mode)?;
     if state.snapshot.snapshot_id != *snapshot_id {
-        return Err(AppError::new(
-            "stale_snapshot",
-            format!(
-                "snapshot '{}' no longer matches the current {} view '{}'",
-                snapshot_id,
-                mode.as_str(),
-                state.snapshot.snapshot_id
-            ),
-        ));
+        return Err(stale_snapshot_error(mode, snapshot_id, &state, selection));
     }
     Ok(state)
+}
+
+fn stale_snapshot_error(
+    mode: cli::Mode,
+    requested_snapshot: &str,
+    state: &ScanState,
+    selection: &SelectionInput,
+) -> AppError {
+    let validation = validate::summarize_selection(state, selection);
+    AppError::new(
+        "stale_snapshot",
+        format!(
+            "snapshot '{}' no longer matches the current {} view '{}'",
+            requested_snapshot,
+            mode.as_str(),
+            state.snapshot.snapshot_id.as_str()
+        ),
+    )
+    .with_details(serde_json::json!({
+        "mode": mode.as_str(),
+        "requested_snapshot_id": requested_snapshot,
+        "current_snapshot_id": state.snapshot.snapshot_id,
+        "snapshot_matches": validation.snapshot_matches,
+        "directly_usable": validation.directly_usable,
+        "can_apply": validation.can_apply,
+        "resolved_selectors": validation.resolved_selectors,
+        "unresolved_selectors": validation.unresolved_selectors,
+        "matched_changes": validation.matched_changes,
+    }))
 }
 
 fn load_selection_input(
@@ -276,16 +332,30 @@ fn load_selection_input(
     };
 
     if let Some(path) = plan_path {
-        let contents = std::fs::read_to_string(&path).map_err(|err| {
-            AppError::new(
-                "plan_read_failed",
-                format!("failed to read {}: {}", path.display(), err),
-            )
-        })?;
+        let display = path.display().to_string();
+        let contents = if path == PathBuf::from("-") {
+            let mut contents = String::new();
+            std::io::stdin()
+                .read_to_string(&mut contents)
+                .map_err(|err| {
+                    AppError::new(
+                        "plan_read_failed",
+                        format!("failed to read {}: {}", display, err),
+                    )
+                })?;
+            contents
+        } else {
+            std::fs::read_to_string(&path).map_err(|err| {
+                AppError::new(
+                    "plan_read_failed",
+                    format!("failed to read {}: {}", display, err),
+                )
+            })?
+        };
         let plan: SelectionPlan = serde_json::from_str(&contents).map_err(|err| {
             AppError::new(
                 "plan_parse_failed",
-                format!("failed to parse {}: {}", path.display(), err),
+                format!("failed to parse {}: {}", display, err),
             )
         })?;
 
@@ -331,7 +401,9 @@ pub enum CommandOutput {
     Scan(SnapshotOutput),
     Show(ShowResponse),
     Resolve(resolve::ResolveResponse),
+    Validate(validate::ValidateResponse),
     Mutation(MutationResponse),
+    MutationDryRun(MutationDryRunResponse),
     Commit(CommitResponse),
     CommitDryRun(CommitDryRunResponse),
 }
@@ -346,7 +418,9 @@ impl CommandOutput {
             CommandOutput::Scan(snapshot) => snapshot.to_text(),
             CommandOutput::Show(show) => show.to_text(),
             CommandOutput::Resolve(response) => response.to_text(),
+            CommandOutput::Validate(response) => response.to_text(),
             CommandOutput::Mutation(response) => response.to_text(),
+            CommandOutput::MutationDryRun(response) => response.to_text(),
             CommandOutput::Commit(response) => response.to_text(),
             CommandOutput::CommitDryRun(response) => response.to_text(),
         }
@@ -362,7 +436,9 @@ impl Serialize for CommandOutput {
             CommandOutput::Scan(snapshot) => snapshot.serialize(serializer),
             CommandOutput::Show(show) => show.serialize(serializer),
             CommandOutput::Resolve(response) => response.serialize(serializer),
+            CommandOutput::Validate(response) => response.serialize(serializer),
             CommandOutput::Mutation(response) => response.serialize(serializer),
+            CommandOutput::MutationDryRun(response) => response.serialize(serializer),
             CommandOutput::Commit(response) => response.serialize(serializer),
             CommandOutput::CommitDryRun(response) => response.serialize(serializer),
         }
@@ -448,6 +524,36 @@ impl MutationResponse {
         format!(
             "{}d {} hunks, {} changes, {} change keys, and {} line ranges\nnext snapshot: {}",
             self.action,
+            self.selected_hunks.len(),
+            self.selected_changes.len(),
+            self.selected_change_keys.len(),
+            self.selected_line_ranges.len(),
+            self.snapshot_id
+        )
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct MutationDryRunResponse {
+    pub action: &'static str,
+    pub dry_run: bool,
+    pub snapshot_id: String,
+    pub mode: cli::Mode,
+    pub selected_hunks: Vec<String>,
+    pub selected_changes: Vec<String>,
+    pub selected_change_keys: Vec<String>,
+    pub selected_line_ranges: Vec<String>,
+    pub files: Vec<String>,
+    pub patch: String,
+    pub diffstat: String,
+}
+
+impl MutationDryRunResponse {
+    fn to_text(&self) -> String {
+        format!(
+            "would {} {} files using {} hunks, {} changes, {} change keys, and {} line ranges\nsnapshot: {}",
+            self.action,
+            self.files.len(),
             self.selected_hunks.len(),
             self.selected_changes.len(),
             self.selected_change_keys.len(),

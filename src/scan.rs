@@ -5,8 +5,9 @@ use crate::diff::{ParsedHunk, ParsedPatch, parse_patch};
 use crate::error::{AppError, AppResult};
 use crate::git;
 use crate::model::{
-    ChangeState, ChangeView, FileState, FileView, HunkState, HunkView, LineKind, PatchLine,
-    ScanState, SnapshotView, UnsupportedPath,
+    CHANGE_KEY_SCHEME, ChangeState, ChangeView, FileState, FileView, HunkState, HunkView, LineKind,
+    PatchLine, ScanState, SnapshotView, UnsupportedPath, change_selector_bundle,
+    hunk_selector_bundle,
 };
 
 pub fn scan_repo(repo_root: &std::path::Path, mode: Mode) -> AppResult<ScanState> {
@@ -79,8 +80,10 @@ pub fn scan_repo(repo_root: &std::path::Path, mode: Mode) -> AppResult<ScanState
         }
     }
 
+    let selector_snapshot_id = snapshot_id.clone();
     let snapshot = SnapshotView {
         snapshot_id,
+        change_key_scheme: CHANGE_KEY_SCHEME,
         mode,
         files: files
             .iter()
@@ -92,6 +95,7 @@ pub fn scan_repo(repo_root: &std::path::Path, mode: Mode) -> AppResult<ScanState
                     .iter()
                     .map(|hunk| HunkView {
                         id: hunk.id.clone(),
+                        selectors: hunk_selector_bundle(&selector_snapshot_id, &hunk.id),
                         header: hunk.header.clone(),
                         old_start: hunk.old_start,
                         old_lines: hunk.old_lines,
@@ -111,6 +115,16 @@ pub fn scan_repo(repo_root: &std::path::Path, mode: Mode) -> AppResult<ScanState
                                 ChangeView {
                                     id: change.id.clone(),
                                     change_key: change.change_key.clone(),
+                                    selectors: change_selector_bundle(
+                                        &selector_snapshot_id,
+                                        &hunk.id,
+                                        &change.id,
+                                        &change.change_key,
+                                        change.old_start,
+                                        change.old_lines,
+                                        change.new_start,
+                                        change.new_lines,
+                                    ),
                                     header: change.header.clone(),
                                     old_start: change.old_start,
                                     old_lines: change.old_lines,

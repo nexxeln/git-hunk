@@ -6,7 +6,10 @@ use serde_json::json;
 
 use crate::cli::{Mode, ResolveSide};
 use crate::error::{AppError, AppResult};
-use crate::model::{ChangeMetadata, LineSide, ScanState};
+use crate::model::{
+    CHANGE_KEY_SCHEME, ChangeMetadata, ChangeSelectorBundle, LineSide, ScanState,
+    change_selector_bundle,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -21,6 +24,7 @@ pub struct ResolveCandidate {
     pub change_id: String,
     pub change_key: String,
     pub hunk_id: String,
+    pub selectors: ChangeSelectorBundle,
     pub side: LineSide,
     pub start: u32,
     pub end: u32,
@@ -31,6 +35,7 @@ pub struct ResolveCandidate {
 #[derive(Debug, Clone, Serialize)]
 pub struct ResolveResponse {
     pub snapshot_id: String,
+    pub change_key_scheme: &'static str,
     pub mode: Mode,
     pub path: String,
     pub requested_side: ResolveSide,
@@ -43,6 +48,7 @@ pub struct ResolveResponse {
     pub recommended_change_ids: Vec<String>,
     pub recommended_change_keys: Vec<String>,
     pub recommended_hunk_selectors: Vec<String>,
+    pub recommended_selectors: Vec<ChangeSelectorBundle>,
     pub candidates: Vec<ResolveCandidate>,
 }
 
@@ -148,6 +154,7 @@ pub fn resolve_region(
 
     Ok(ResolveResponse {
         snapshot_id: state.snapshot.snapshot_id.clone(),
+        change_key_scheme: CHANGE_KEY_SCHEME,
         mode: state.snapshot.mode,
         path: file.path.clone(),
         requested_side,
@@ -159,6 +166,7 @@ pub fn resolve_region(
         recommended_change_ids: best.change_ids,
         recommended_change_keys: best.change_keys,
         recommended_hunk_selectors: best.hunk_selectors,
+        recommended_selectors: best.selector_bundles,
         candidates: best.candidates,
     })
 }
@@ -173,6 +181,7 @@ struct SideResolution {
     change_keys: Vec<String>,
     hunk_ids: Vec<String>,
     hunk_selectors: Vec<String>,
+    selector_bundles: Vec<ChangeSelectorBundle>,
     candidates: Vec<ResolveCandidate>,
 }
 
@@ -258,6 +267,7 @@ fn build_resolution(
     let mut hunk_ids = Vec::new();
     let mut change_ids = Vec::new();
     let mut change_keys = Vec::new();
+    let mut selector_bundles = Vec::new();
     let mut candidates = Vec::new();
 
     for (change_index, range_start, range_end, change_distance) in entries {
@@ -274,10 +284,22 @@ fn build_resolution(
         }
         change_ids.push(change.id.clone());
         change_keys.push(change.change_key.clone());
+        let selectors = change_selector_bundle(
+            &state.snapshot.snapshot_id,
+            &hunk.id,
+            &change.id,
+            &change.change_key,
+            change.old_start,
+            change.old_lines,
+            change.new_start,
+            change.new_lines,
+        );
+        selector_bundles.push(selectors.clone());
         candidates.push(ResolveCandidate {
             change_id: change.id.clone(),
             change_key: change.change_key.clone(),
             hunk_id: hunk.id.clone(),
+            selectors,
             side,
             start: range_start,
             end: range_end,
@@ -322,6 +344,7 @@ fn build_resolution(
         change_keys,
         hunk_ids,
         hunk_selectors,
+        selector_bundles,
         candidates,
     }
 }

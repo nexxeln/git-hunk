@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::cli::Mode;
 
+pub const CHANGE_KEY_SCHEME: &str = "v1";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LineSide {
@@ -16,6 +18,62 @@ impl LineSide {
             LineSide::New => "new",
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SelectorRef {
+    Hunk {
+        id: String,
+    },
+    Change {
+        id: String,
+    },
+    ChangeKey {
+        key: String,
+        scheme: &'static str,
+    },
+    LineRange {
+        hunk_id: String,
+        side: LineSide,
+        start: u32,
+        end: u32,
+    },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HunkSelectorBundle {
+    pub snapshot_id: String,
+    pub hunk_id: String,
+    pub recommended_selector: SelectorRef,
+    pub selectors: HunkSelectors,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HunkSelectors {
+    pub hunk: SelectorRef,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChangeSelectorBundle {
+    pub snapshot_id: String,
+    pub hunk_id: String,
+    pub change_id: String,
+    pub change_key: String,
+    pub change_key_scheme: &'static str,
+    pub recommended_selector: SelectorRef,
+    pub selectors: ChangeSelectors,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChangeSelectors {
+    pub hunk: SelectorRef,
+    pub change: SelectorRef,
+    pub change_key: SelectorRef,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_range: Option<SelectorRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_range: Option<SelectorRef>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -133,6 +191,7 @@ impl ChangeMetadata {
 pub struct ChangeView {
     pub id: String,
     pub change_key: String,
+    pub selectors: ChangeSelectorBundle,
     pub header: String,
     pub old_start: u32,
     pub old_lines: u32,
@@ -145,6 +204,7 @@ pub struct ChangeView {
 #[derive(Debug, Clone, Serialize)]
 pub struct HunkView {
     pub id: String,
+    pub selectors: HunkSelectorBundle,
     pub header: String,
     pub old_start: u32,
     pub old_lines: u32,
@@ -170,6 +230,7 @@ pub struct UnsupportedPath {
 #[derive(Debug, Clone, Serialize)]
 pub struct SnapshotView {
     pub snapshot_id: String,
+    pub change_key_scheme: &'static str,
     pub mode: Mode,
     pub files: Vec<FileView>,
     pub unsupported: Vec<UnsupportedPath>,
@@ -204,6 +265,7 @@ impl SnapshotView {
 pub struct CompactChangeView {
     pub id: String,
     pub change_key: String,
+    pub selectors: ChangeSelectorBundle,
     pub header: String,
     pub old_start: u32,
     pub old_lines: u32,
@@ -215,6 +277,7 @@ pub struct CompactChangeView {
 #[derive(Debug, Clone, Serialize)]
 pub struct CompactHunkView {
     pub id: String,
+    pub selectors: HunkSelectorBundle,
     pub header: String,
     pub old_start: u32,
     pub old_lines: u32,
@@ -233,6 +296,7 @@ pub struct CompactFileView {
 #[derive(Debug, Clone, Serialize)]
 pub struct CompactSnapshotView {
     pub snapshot_id: String,
+    pub change_key_scheme: &'static str,
     pub mode: Mode,
     pub files: Vec<CompactFileView>,
     pub unsupported: Vec<UnsupportedPath>,
@@ -267,6 +331,7 @@ impl From<&SnapshotView> for CompactSnapshotView {
     fn from(snapshot: &SnapshotView) -> Self {
         Self {
             snapshot_id: snapshot.snapshot_id.clone(),
+            change_key_scheme: snapshot.change_key_scheme,
             mode: snapshot.mode,
             files: snapshot
                 .files
@@ -279,6 +344,7 @@ impl From<&SnapshotView> for CompactSnapshotView {
                         .iter()
                         .map(|hunk| CompactHunkView {
                             id: hunk.id.clone(),
+                            selectors: hunk.selectors.clone(),
                             header: hunk.header.clone(),
                             old_start: hunk.old_start,
                             old_lines: hunk.old_lines,
@@ -290,6 +356,7 @@ impl From<&SnapshotView> for CompactSnapshotView {
                                 .map(|change| CompactChangeView {
                                     id: change.id.clone(),
                                     change_key: change.change_key.clone(),
+                                    selectors: change.selectors.clone(),
                                     header: change.header.clone(),
                                     old_start: change.old_start,
                                     old_lines: change.old_lines,
@@ -305,6 +372,73 @@ impl From<&SnapshotView> for CompactSnapshotView {
             unsupported: snapshot.unsupported.clone(),
         }
     }
+}
+
+pub fn hunk_selector_bundle(snapshot_id: &str, hunk_id: &str) -> HunkSelectorBundle {
+    let hunk = SelectorRef::Hunk {
+        id: hunk_id.to_string(),
+    };
+    HunkSelectorBundle {
+        snapshot_id: snapshot_id.to_string(),
+        hunk_id: hunk_id.to_string(),
+        recommended_selector: hunk.clone(),
+        selectors: HunkSelectors { hunk },
+    }
+}
+
+pub fn change_selector_bundle(
+    snapshot_id: &str,
+    hunk_id: &str,
+    change_id: &str,
+    change_key: &str,
+    old_start: u32,
+    old_lines: u32,
+    new_start: u32,
+    new_lines: u32,
+) -> ChangeSelectorBundle {
+    let hunk = SelectorRef::Hunk {
+        id: hunk_id.to_string(),
+    };
+    let change = SelectorRef::Change {
+        id: change_id.to_string(),
+    };
+    let change_key = SelectorRef::ChangeKey {
+        key: change_key.to_string(),
+        scheme: CHANGE_KEY_SCHEME,
+    };
+
+    ChangeSelectorBundle {
+        snapshot_id: snapshot_id.to_string(),
+        hunk_id: hunk_id.to_string(),
+        change_id: change_id.to_string(),
+        change_key: match &change_key {
+            SelectorRef::ChangeKey { key, .. } => key.clone(),
+            _ => unreachable!("change key selector should always be a change key"),
+        },
+        change_key_scheme: CHANGE_KEY_SCHEME,
+        recommended_selector: change_key.clone(),
+        selectors: ChangeSelectors {
+            hunk,
+            change,
+            change_key,
+            old_range: line_range_selector(hunk_id, LineSide::Old, old_start, old_lines),
+            new_range: line_range_selector(hunk_id, LineSide::New, new_start, new_lines),
+        },
+    }
+}
+
+fn line_range_selector(
+    hunk_id: &str,
+    side: LineSide,
+    start: u32,
+    lines: u32,
+) -> Option<SelectorRef> {
+    (lines > 0).then(|| SelectorRef::LineRange {
+        hunk_id: hunk_id.to_string(),
+        side,
+        start,
+        end: start + lines - 1,
+    })
 }
 
 #[derive(Debug, Clone)]
